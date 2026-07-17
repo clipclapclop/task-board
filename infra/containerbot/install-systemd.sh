@@ -18,6 +18,9 @@ if ! grep -Fq 'import /etc/caddy/conf.d/*.Caddyfile' /etc/caddy/Caddyfile; then
 	cp /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.pre-task-board"
 	printf '\nimport /etc/caddy/conf.d/*.Caddyfile\n' >> /etc/caddy/Caddyfile
 fi
+set -a
+. /etc/caddy/cloudflare.env
+set +a
 caddy validate --config /etc/caddy/Caddyfile
 systemctl reload caddy
 systemctl daemon-reload
