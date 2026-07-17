@@ -30,7 +30,11 @@ func Create(ctx context.Context, st *store.Store, destination, revision string) 
 	if err := os.MkdirAll(destination, 0o750); err != nil {
 		return "", err
 	}
-	tmp, err := os.MkdirTemp(filepath.Dir(destination), "task-board-backup-")
+	// Build and validate the snapshot in the container's private temporary
+	// filesystem. The destination may be a mount at the filesystem root (for
+	// example /nas), so its parent is not necessarily writable by the non-root
+	// runtime user.
+	tmp, err := os.MkdirTemp("", "task-board-backup-")
 	if err != nil {
 		return "", err
 	}

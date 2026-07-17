@@ -12,6 +12,11 @@ import (
 
 func TestCreateVerifyRehearse(t *testing.T) {
 	root := t.TempDir()
+	tempRoot := filepath.Join(root, "tmp")
+	if err := os.Mkdir(tempRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", tempRoot)
 	st, err := store.Open(filepath.Join(root, "state.sqlite3"))
 	if err != nil {
 		t.Fatal(err)
@@ -26,6 +31,13 @@ func TestCreateVerifyRehearse(t *testing.T) {
 	}
 	if _, err = os.Stat(archive); err != nil {
 		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(tempRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temporary backup files were not removed: %v", entries)
 	}
 	if err = Verify(archive); err != nil {
 		t.Fatal(err)
