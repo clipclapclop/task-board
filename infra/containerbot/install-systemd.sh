@@ -4,7 +4,9 @@ set -eu
 if [ "$(id -u)" -ne 0 ]; then echo "run as root" >&2; exit 1; fi
 
 source_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-install -d -o serviceuser -g users -m 0750 /srv/task-board /var/lib/task-board /var/lib/task-board/secrets /var/lib/task-board/predeploy
+install -d -o serviceuser -g users -m 0750 /srv/task-board
+install -d -o serviceuser -g users -m 0700 /var/lib/task-board /var/lib/task-board/secrets /var/lib/task-board/predeploy
+find /var/lib/task-board -maxdepth 1 -type f -name 'task-board.sqlite3*' -exec chmod 0600 {} +
 if [ ! -f /var/lib/task-board/secrets/app.env ]; then
 	install -o serviceuser -g users -m 0600 "$source_dir/app.env.example" /var/lib/task-board/secrets/app.env
 fi

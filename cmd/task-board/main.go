@@ -38,6 +38,10 @@ func openStore() (*store.Store, error) {
 }
 
 func main() {
+	// Database files, WAL files, and administrative state may contain API-token
+	// hashes. Keep newly created files private even if a library requests a more
+	// permissive mode.
+	syscall.Umask(0o077)
 	if err := run(os.Args[1:]); err != nil {
 		slog.Error("command failed", "error", err)
 		os.Exit(1)
