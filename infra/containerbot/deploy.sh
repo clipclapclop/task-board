@@ -6,8 +6,6 @@ deploy="$checkout/infra/containerbot"
 state=/var/lib/task-board
 revision_file="$state/deployed-revision"
 image_file="$state/deployed-image"
-export GIT_SSH_COMMAND="ssh -i /home/serviceuser/.ssh/task_board_deploy_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-
 cd "$checkout"
 git fetch origin main
 git checkout --force main

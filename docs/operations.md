@@ -4,11 +4,10 @@
 
 1. Create a Cloudflare DNS-only A record for `task-board.oorangy.com` pointing to
    `100.122.228.62`. Do not proxy it through Cloudflare and do not add a public IP.
-2. Install a read-only GitHub deploy key for this repository as
-   `/home/serviceuser/.ssh/task_board_deploy_ed25519` and configure the checkout remote.
-3. Clone the repository to `/srv/task-board/checkout` as `serviceuser`.
-4. From that checkout, run `sudo infra/containerbot/install-systemd.sh`.
-5. Confirm `caddy validate --config /etc/caddy/Caddyfile` succeeds.
+2. Clone the public repository over read-only HTTPS to `/srv/task-board/checkout` as
+   `serviceuser`: `git clone https://github.com/clipclapclop/task-board.git /srv/task-board/checkout`.
+3. From that checkout, run `sudo infra/containerbot/install-systemd.sh`.
+4. Confirm `caddy validate --config /etc/caddy/Caddyfile` succeeds.
 
 The install script preserves the pre-change Caddyfile, installs a private site snippet, creates
 state directories, and enables the daily backup and monthly rehearsal timers.
