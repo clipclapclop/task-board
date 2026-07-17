@@ -432,6 +432,7 @@ func (s *Server) currentActor(ctx context.Context, r *http.Request) (model.Actor
 
 type pageData struct {
 	Page, Title, CSRF, View, Error, Notice, NewToken string
+	NextURL                                          string
 	Current                                          model.Actor
 	Actors                                           []model.Actor
 	Projects                                         []model.Project
@@ -504,11 +505,31 @@ func (s *Server) tasksPage(w http.ResponseWriter, r *http.Request) {
 		view = "mine"
 	}
 	data.View = view
-	f := model.TaskFilter{Statuses: formIDs(r.URL.Query()["status"]), ProjectID: r.URL.Query().Get("project"), Query: r.URL.Query().Get("q"), Limit: 100}
+	f := model.TaskFilter{Statuses: formIDs(r.URL.Query()["status"]), ProjectID: r.URL.Query().Get("project"), Query: r.URL.Query().Get("q"), AssignedTo: r.URL.Query().Get("assigned_to"), CreatedBy: r.URL.Query().Get("created_by"), Cursor: r.URL.Query().Get("cursor"), Limit: 50}
 	if view == "mine" {
-		f.AssignedTo = data.Current.ID
+		if f.AssignedTo == "" {
+			f.AssignedTo = data.Current.ID
+		}
 	} else if view == "created" {
-		f.CreatedBy = data.Current.ID
+		if f.CreatedBy == "" {
+			f.CreatedBy = data.Current.ID
+		}
+	}
+	if value := r.URL.Query().Get("actionable"); value != "" {
+		parsed, parseErr := strconv.ParseBool(value)
+		if parseErr != nil {
+			s.renderError(w, r, 422, store.ErrInvalid)
+			return
+		}
+		f.Actionable = &parsed
+	}
+	if value := r.URL.Query().Get("updated_after"); value != "" {
+		parsed, parseErr := time.Parse(time.RFC3339, value)
+		if parseErr != nil {
+			s.renderError(w, r, 422, fmt.Errorf("%w: updated_after must be RFC 3339", store.ErrInvalid))
+			return
+		}
+		f.UpdatedAfter = &parsed
 	}
 	page, err := s.Store.Tasks(r.Context(), f)
 	if err != nil {
@@ -516,6 +537,11 @@ func (s *Server) tasksPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data.Tasks = page.Data
+	if page.NextCursor != "" {
+		query := r.URL.Query()
+		query.Set("cursor", page.NextCursor)
+		data.NextURL = "/tasks?" + query.Encode()
+	}
 	s.render(w, data)
 }
 func (s *Server) taskNewPage(w http.ResponseWriter, r *http.Request) {
