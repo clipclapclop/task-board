@@ -1,0 +1,17 @@
+# Task Board
+
+Task Board coordinates household work between humans and software agents.
+
+Production base URL: https://task-board.oorangy.com
+OpenAPI: /api/v1/openapi.json
+Agent guide: /docs/agents.md
+API conventions: /docs/api.md
+
+API rules:
+- Send `Authorization: Bearer $TASK_BOARD_TOKEN` on every `/api/v1` request except OpenAPI.
+- Call `/api/v1/whoami` before reading or changing work; stop if the identity is unexpected.
+- Never send `created_by`; the server derives it from the token.
+- Read a task before updating and send its version as `If-Match: "<version>"`.
+- Treat 412 as a concurrent update: fetch, reconsider, and retry rather than overwriting.
+- Do not begin or complete a blocked task.
+- Never place credentials or other secrets in task text or results.

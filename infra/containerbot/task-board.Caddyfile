@@ -1,0 +1,9 @@
+task-board.oorangy.com {
+	bind 100.122.228.62
+
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+
+	reverse_proxy 127.0.0.1:8787
+}

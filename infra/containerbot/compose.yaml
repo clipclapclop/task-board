@@ -1,0 +1,39 @@
+services:
+  app:
+    image: ${TASK_BOARD_IMAGE:-task-board:development}
+    restart: unless-stopped
+    user: "1034:100"
+    env_file: .env
+    environment:
+      TASK_BOARD_DATABASE: /state/task-board.sqlite3
+      TASK_BOARD_LISTEN: :8080
+      TASK_BOARD_PUBLIC_URL: https://task-board.oorangy.com
+      TASK_BOARD_ALLOWED_HOST: task-board.oorangy.com
+      TASK_BOARD_DEFAULT_ACTOR: chad
+      TASK_BOARD_DEFAULT_ACTOR_NAME: Chad
+    ports:
+      - "127.0.0.1:8787:8080"
+    volumes:
+      - /var/lib/task-board:/state
+    healthcheck:
+      test: ["CMD", "/task-board", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backup:
+    profiles: ["tools"]
+    image: ${TASK_BOARD_IMAGE:-task-board:development}
+    user: "1034:100"
+    env_file: .env
+    environment:
+      TASK_BOARD_DATABASE: /state/task-board.sqlite3
+      TASK_BOARD_BACKUP_ROOT: /nas
+    volumes:
+      - /var/lib/task-board:/state
+      - /home/serviceuser/nas/docs/TaskBoardBackups:/nas

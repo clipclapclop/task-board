@@ -1,0 +1,10 @@
+[Unit]
+Description=Manually deploy the tested Task Board main revision
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+User=serviceuser
+WorkingDirectory=/srv/task-board/checkout
+ExecStart=/bin/sh /srv/task-board/checkout/infra/containerbot/deploy.sh
+TimeoutStartSec=30min

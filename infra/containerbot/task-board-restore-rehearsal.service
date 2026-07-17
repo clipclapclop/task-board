@@ -1,0 +1,10 @@
+[Unit]
+Description=Verify the newest Task Board backup in isolation
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+User=serviceuser
+WorkingDirectory=/srv/task-board/checkout
+ExecStart=/usr/bin/flock --wait 600 /var/lib/task-board/backup.lock /bin/sh /srv/task-board/checkout/infra/containerbot/rehearse-restore.sh
+TimeoutStartSec=30min
