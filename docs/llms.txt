@@ -6,12 +6,14 @@ Production base URL: https://task-board.oorangy.com
 OpenAPI: /api/v1/openapi.json
 Agent guide: /docs/agents.md
 API conventions: /docs/api.md
+Worker contract: /docs/worker-contract.md
 
 API rules:
 - Send `Authorization: Bearer $TASK_BOARD_TOKEN` on every `/api/v1` request except OpenAPI.
 - Call `/api/v1/whoami` before reading or changing work; stop if the identity is unexpected.
 - Never send `created_by`; the server derives it from the token.
-- Read a task before updating and send its version as `If-Match: "<version>"`.
-- Treat 412 as a concurrent update: fetch, reconsider, and retry rather than overwriting.
-- Do not begin or complete a blocked task.
+- Service actors request one project through `POST /api/v1/work/ready`; do not list or fetch tasks.
+- A 204 ready response means caught up; invoke no LLM or executor.
+- Complete owned work through `POST /api/v1/work/{task_id}/complete`.
+- Every created task requires a project; use stable idempotency keys for retryable creation.
 - Never place credentials or other secrets in task text or results.

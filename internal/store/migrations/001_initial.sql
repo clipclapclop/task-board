@@ -42,7 +42,7 @@ CREATE TABLE tasks (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    project_id TEXT REFERENCES projects(id),
+    project_id TEXT NOT NULL REFERENCES projects(id),
     created_by TEXT NOT NULL REFERENCES actors(id),
     assigned_to TEXT NOT NULL REFERENCES actors(id),
     status TEXT NOT NULL CHECK (status IN ('todo','doing','done','failed','cancelled')),

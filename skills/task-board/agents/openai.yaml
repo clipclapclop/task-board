@@ -1,4 +1,4 @@
 interface:
   display_name: "Task Board"
   short_description: "Coordinate household tasks with agents"
-  default_prompt: "Use $task-board to verify identity, find actionable work, and update tasks safely."
+  default_prompt: "Use $task-board to verify identity, receive ready project work, complete owned work, and create dependency-safe handoffs."

@@ -86,6 +86,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /llms.txt", s.projectDoc("llms.txt", "text/plain; charset=utf-8"))
 	s.mux.HandleFunc("GET /docs/agents.md", s.projectDoc("agents.md", "text/markdown; charset=utf-8"))
 	s.mux.HandleFunc("GET /docs/api.md", s.projectDoc("api.md", "text/markdown; charset=utf-8"))
+	s.mux.HandleFunc("GET /docs/worker-contract.md", s.projectDoc("worker-contract.md", "text/markdown; charset=utf-8"))
 	s.mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/tasks", http.StatusSeeOther) })
 	s.mux.HandleFunc("GET /login", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/tasks", http.StatusSeeOther) })
 	s.mux.HandleFunc("POST /logout", s.webPost(s.logout))
@@ -218,6 +219,16 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 
 func statusFor(err error) (int, string) {
 	switch {
+	case errors.Is(err, store.ErrServiceActorRequired):
+		return 403, "service_actor_required"
+	case errors.Is(err, store.ErrWorkNotOwned):
+		return 409, "work_not_owned"
+	case errors.Is(err, store.ErrCompletionConflict):
+		return 409, "completion_conflict"
+	case errors.Is(err, store.ErrAmbiguousActiveWork):
+		return 409, "ambiguous_active_work"
+	case errors.Is(err, store.ErrInvalidProject):
+		return 422, "invalid_project"
 	case errors.Is(err, store.ErrNotFound):
 		return 404, "not_found"
 	case errors.Is(err, store.ErrForbidden):
@@ -251,6 +262,11 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		v = strings.TrimSuffix(v, "/reopen")
 		return strings.Trim(v, "/")
 	}
+	workTaskID := func() string {
+		v := strings.TrimPrefix(p, "/api/v1/work/")
+		v = strings.TrimSuffix(v, "/complete")
+		return strings.Trim(v, "/")
+	}
 	switch {
 	case r.Method == "GET" && p == "/api/v1/whoami":
 		jsonResponse(w, 200, a)
@@ -268,7 +284,44 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonResponse(w, 200, map[string]any{"data": projects})
+	case r.Method == "POST" && p == "/api/v1/work/ready":
+		var in struct {
+			ProjectID string `json:"project_id"`
+		}
+		if !decodeJSON(w, r, &in) {
+			return
+		}
+		delivery, found, err := s.Store.ReadyWork(r.Context(), a, in.ProjectID)
+		if err != nil {
+			storeProblem(w, err)
+			return
+		}
+		if !found {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, delivery.Task.Version))
+		jsonResponse(w, 200, delivery)
+	case r.Method == "POST" && strings.HasPrefix(p, "/api/v1/work/") && strings.HasSuffix(p, "/complete"):
+		var in struct {
+			Status string `json:"status"`
+			Result string `json:"result"`
+		}
+		if !decodeJSON(w, r, &in) {
+			return
+		}
+		t, err := s.Store.CompleteWork(r.Context(), a, workTaskID(), in.Status, in.Result)
+		if err != nil {
+			storeProblem(w, err)
+			return
+		}
+		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, t.Version))
+		jsonResponse(w, 200, t)
 	case r.Method == "GET" && p == "/api/v1/tasks":
+		if a.IsService() {
+			problem(w, 403, "service_task_access_forbidden", "Forbidden", "Service actors receive tasks only through /api/v1/work/ready.", nil)
+			return
+		}
 		s.apiTasks(w, r)
 	case r.Method == "POST" && p == "/api/v1/tasks":
 		var in store.CreateTaskInput
@@ -286,6 +339,10 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, t.Version))
 		jsonResponse(w, 201, t)
 	case r.Method == "GET" && strings.HasPrefix(p, "/api/v1/tasks/") && !strings.HasSuffix(p, "/reopen"):
+		if a.IsService() {
+			problem(w, 403, "service_task_access_forbidden", "Forbidden", "Service actors cannot browse task details.", nil)
+			return
+		}
 		id := taskID()
 		t, err := s.Store.Task(r.Context(), id)
 		if err != nil {
@@ -300,6 +357,10 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, t.Version))
 		jsonResponse(w, 200, map[string]any{"task": t, "events": events})
 	case r.Method == "PATCH" && strings.HasPrefix(p, "/api/v1/tasks/") && !strings.HasSuffix(p, "/reopen"):
+		if a.IsService() {
+			problem(w, 403, "service_task_access_forbidden", "Forbidden", "Service actors complete owned work through /api/v1/work/{task_id}/complete.", nil)
+			return
+		}
 		id := taskID()
 		if r.Header.Get("If-Match") == "" {
 			problem(w, 428, "precondition_required", "Precondition required", "Supply the task version in If-Match.", nil)
@@ -322,6 +383,10 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, t.Version))
 		jsonResponse(w, 200, t)
 	case r.Method == "POST" && strings.HasSuffix(p, "/reopen"):
+		if a.IsService() {
+			problem(w, 403, "service_task_access_forbidden", "Forbidden", "Service actors cannot reopen tasks.", nil)
+			return
+		}
 		id := taskID()
 		if r.Header.Get("If-Match") == "" {
 			problem(w, 428, "precondition_required", "Precondition required", "Supply If-Match.", nil)

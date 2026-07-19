@@ -27,16 +27,22 @@ disabled.
 
 Projects have a UUIDv7 ID, unique name, optional description, creator, timestamps, and optional
 archive time. Administrators create, edit, and archive projects. Archived projects remain visible
-on old tasks but cannot be used for new tasks.
+on old tasks but cannot be used for new tasks. Before this pre-adoption contract is rolled out,
+operators manually backfill or discard any projectless records; they do not invent a `Legacy`
+project.
 
 ## Tasks
 
-Tasks have a UUIDv7 ID, title, optional description and project, creator, one assignee, status
+Tasks have a UUIDv7 ID, title, optional description, required project, creator, one assignee, status
 (`todo`, `doing`, `done`, `failed`, or `cancelled`), optional result, optimistic-concurrency
-version, and timestamps. Tasks are never deleted. All active actors may read all tasks.
+version, and timestamps. Tasks are never deleted.
 
-Creators may edit and cancel their unfinished tasks. Assignees may update status and result.
-Administrators may perform either action on any task and explicitly reopen a terminal task.
+Human actors may read all tasks. Service actors receive task content only through project-scoped
+worker delivery and cannot browse task lists, details, or history. Creators may edit and cancel
+todo tasks. While a task is doing, its instructions, project, assignee, and dependencies are frozen,
+though a human may cancel it. Human assignees may update status and result through the general task
+API. Service assignees use the dedicated ready and completion operations. Administrators may
+perform human actions on any task and explicitly reopen a terminal task.
 Terminal statuses are immutable except for administrator reopen. Reopen clears the current result
 but history retains it.
 
@@ -44,8 +50,11 @@ A task may depend on multiple tasks, including tasks in other projects. It is ac
 when every blocker is `done`; failed or cancelled blockers continue blocking. Blocked tasks may
 not start, finish, or fail, but may be cancelled. Direct and indirect cycles are rejected.
 
-Every mutation appends an immutable event recording actor, event type, changed fields, and time.
-Comments and attachments are not part of v1.
+Ready delivery first redelivers existing doing work for one service actor/project pair; otherwise
+it atomically claims the oldest actionable todo task for that actor and project. Delivery includes
+the optional results of direct completed blockers so dependency-gated continuations can consume
+upstream output without browsing unrelated tasks. Every mutation appends an immutable event
+recording actor, event type, changed fields, and time. Comments and attachments are not part of v1.
 
 ## Portal
 
@@ -57,10 +66,12 @@ tokens, projects, and sanitized export. Essential actions work without JavaScrip
 ## API
 
 Machine routes are versioned under `/api/v1`. Operational health routes and browser pages are
-unversioned. V1 includes actors, projects, task create/list/get/patch/reopen, `whoami`, sanitized
-export, and OpenAPI endpoints. Task lists use stable cursor pagination. PATCH requires `If-Match`;
-missing and stale versions return 428 and 412. Task creation supports actor-scoped idempotency keys
-for 24 hours. Errors use `application/problem+json` with stable codes.
+unversioned. V1 includes actors, projects, human task list/get/patch/reopen, service ready/complete,
+task creation, `whoami`, sanitized export, and OpenAPI endpoints. Task lists use stable cursor
+pagination. Human PATCH requires `If-Match`; missing and stale versions return 428 and 412. Task
+creation supports actor-scoped idempotency keys for 24 hours. Ready delivery is naturally
+redelivered while work remains doing, and identical completion retries are idempotent. Errors use
+`application/problem+json` with stable codes.
 
 ## Security and operations
 
@@ -81,4 +92,5 @@ rehearsed monthly. Sanitized JSON export excludes tokens and operational state.
 
 Deferred features include public access, passwords or external login, comments, attachments,
 notifications, email, tags, priority, due dates, recurring tasks, multiple assignees, drag-and-drop
-Kanban, and multi-tenancy.
+Kanban, multi-tenancy, a generic runner or reference worker, fleet registry, availability
+heartbeat, execution leases, and worker concurrency or queue-depth limits.

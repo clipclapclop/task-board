@@ -37,6 +37,10 @@ type queryRow interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
+type queryRows interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
 const taskColumns = `id,title,description,COALESCE(project_id,''),created_by,assigned_to,status,result,version,created_at,updated_at`
 
 func scanTask(row interface{ Scan(...any) error }) (model.Task, error) {
@@ -58,8 +62,8 @@ func taskByID(ctx context.Context, q queryRow, id string) (model.Task, error) {
 	return scanTask(q.QueryRowContext(ctx, `SELECT `+taskColumns+` FROM tasks WHERE id=?`, id))
 }
 
-func (s *Store) hydrateTask(ctx context.Context, t *model.Task) error {
-	rows, err := s.DB.QueryContext(ctx, `SELECT x.id,x.title,x.status FROM task_dependencies d JOIN tasks x ON x.id=d.blocked_by_id WHERE d.task_id=? ORDER BY x.created_at,x.id`, t.ID)
+func hydrateTask(ctx context.Context, q queryRows, t *model.Task) error {
+	rows, err := q.QueryContext(ctx, `SELECT x.id,x.title,x.status FROM task_dependencies d JOIN tasks x ON x.id=d.blocked_by_id WHERE d.task_id=? ORDER BY x.created_at,x.id`, t.ID)
 	if err != nil {
 		return err
 	}
@@ -76,6 +80,10 @@ func (s *Store) hydrateTask(ctx context.Context, t *model.Task) error {
 	}
 	t.Actionable = !t.Terminal() && !t.IsBlocked
 	return rows.Err()
+}
+
+func (s *Store) hydrateTask(ctx context.Context, t *model.Task) error {
+	return hydrateTask(ctx, s.DB, t)
 }
 
 func (s *Store) Task(ctx context.Context, id string) (model.Task, error) {
@@ -106,6 +114,9 @@ func validateTaskInput(in CreateTaskInput) error {
 	if in.AssignedTo == "" {
 		return fmt.Errorf("%w: assigned_to is required", ErrInvalid)
 	}
+	if strings.TrimSpace(in.ProjectID) == "" {
+		return fmt.Errorf("%w: project_id is required", ErrInvalidProject)
+	}
 	return nil
 }
 
@@ -123,14 +134,14 @@ func activeActorTx(ctx context.Context, tx *sql.Tx, id string) error {
 }
 func activeProjectTx(ctx context.Context, tx *sql.Tx, id string) error {
 	if id == "" {
-		return nil
+		return fmt.Errorf("%w: project_id is required", ErrInvalidProject)
 	}
 	var ok int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE id=? AND archived_at IS NULL`, id).Scan(&ok); err != nil {
 		return err
 	}
 	if ok != 1 {
-		return fmt.Errorf("%w: project not found or archived", ErrInvalid)
+		return fmt.Errorf("%w: project not found or archived", ErrInvalidProject)
 	}
 	return nil
 }
@@ -267,6 +278,9 @@ func (s *Store) PatchTask(ctx context.Context, actor model.Actor, id string, exp
 	if !actor.Active {
 		return model.Task{}, ErrForbidden
 	}
+	if actor.IsService() {
+		return model.Task{}, ErrForbidden
+	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return model.Task{}, err
@@ -281,6 +295,9 @@ func (s *Store) PatchTask(ctx context.Context, actor model.Actor, id string, exp
 	}
 	if old.Terminal() {
 		return model.Task{}, fmt.Errorf("%w: terminal task", ErrConflict)
+	}
+	if old.Status == "doing" && (in.Title != nil || in.Description != nil || in.ProjectID != nil || in.AssignedTo != nil || in.BlockedBy != nil) {
+		return model.Task{}, fmt.Errorf("%w: doing task details are frozen", ErrConflict)
 	}
 	next := old
 	changes := map[string]any{}
@@ -447,6 +464,191 @@ func (s *Store) ReopenTask(ctx context.Context, actor model.Actor, id string, ex
 		return model.Task{}, err
 	}
 	return s.Task(ctx, id)
+}
+
+func dependencyResults(ctx context.Context, q queryRows, taskID string) ([]model.DependencyResult, error) {
+	rows, err := q.QueryContext(ctx, `SELECT b.id,b.title,b.result,b.status
+		FROM task_dependencies d JOIN tasks b ON b.id=d.blocked_by_id
+		WHERE d.task_id=? ORDER BY b.created_at,b.id`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.DependencyResult{}
+	for rows.Next() {
+		var result model.DependencyResult
+		var status string
+		if err := rows.Scan(&result.TaskID, &result.Title, &result.Result, &status); err != nil {
+			return nil, err
+		}
+		if status != "done" {
+			return nil, ErrBlocked
+		}
+		out = append(out, result)
+	}
+	return out, rows.Err()
+}
+
+func taskWithDependencyResults(ctx context.Context, q queryRows, task model.Task) (model.Task, []model.DependencyResult, error) {
+	results, err := dependencyResults(ctx, q, task.ID)
+	if err != nil {
+		return model.Task{}, nil, err
+	}
+	for _, result := range results {
+		task.BlockedBy = append(task.BlockedBy, model.TaskRef{ID: result.TaskID, Title: result.Title, Status: "done"})
+	}
+	task.IsBlocked = false
+	task.Actionable = !task.Terminal()
+	return task, results, nil
+}
+
+// ReadyWork redelivers the oldest work already owned by the service actor for
+// the project, or atomically claims the oldest actionable todo task.
+func (s *Store) ReadyWork(ctx context.Context, actor model.Actor, projectID string) (model.WorkDelivery, bool, error) {
+	if !actor.IsService() {
+		return model.WorkDelivery{}, false, ErrServiceActorRequired
+	}
+	projectID = strings.TrimSpace(projectID)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return model.WorkDelivery{}, false, err
+	}
+	defer tx.Rollback()
+	if err := activeProjectTx(ctx, tx, projectID); err != nil {
+		return model.WorkDelivery{}, false, err
+	}
+	var doingCount int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE assigned_to=? AND project_id=? AND status='doing'`, actor.ID, projectID).Scan(&doingCount); err != nil {
+		return model.WorkDelivery{}, false, err
+	}
+	if doingCount > 1 {
+		return model.WorkDelivery{}, false, ErrAmbiguousActiveWork
+	}
+	if doingCount == 1 {
+		t, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskColumns+` FROM tasks WHERE assigned_to=? AND project_id=? AND status='doing' ORDER BY created_at,id LIMIT 1`, actor.ID, projectID))
+		if err != nil {
+			return model.WorkDelivery{}, false, err
+		}
+		t, results, err := taskWithDependencyResults(ctx, tx, t)
+		if err != nil {
+			return model.WorkDelivery{}, false, err
+		}
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			return model.WorkDelivery{}, false, err
+		}
+		return model.WorkDelivery{Delivery: "resumed", Task: t, DependencyResults: results}, true, nil
+	}
+
+	row := tx.QueryRowContext(ctx, `SELECT `+taskColumns+` FROM tasks t
+		WHERE t.assigned_to=? AND t.project_id=? AND t.status='todo'
+		AND NOT EXISTS(SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocked_by_id WHERE d.task_id=t.id AND b.status<>'done')
+		ORDER BY t.created_at,t.id LIMIT 1`, actor.ID, projectID)
+	t, err := scanTask(row)
+	if errors.Is(err, ErrNotFound) {
+		return model.WorkDelivery{}, false, nil
+	}
+	if err != nil {
+		return model.WorkDelivery{}, false, err
+	}
+	now := time.Now().UTC()
+	result, err := tx.ExecContext(ctx, `UPDATE tasks SET status='doing',version=version+1,updated_at=? WHERE id=? AND version=? AND status='todo'`, stamp(now), t.ID, t.Version)
+	if err != nil {
+		return model.WorkDelivery{}, false, err
+	}
+	n, _ := result.RowsAffected()
+	if n != 1 {
+		return model.WorkDelivery{}, false, ErrPrecondition
+	}
+	if err := addEvent(ctx, tx, t.ID, actor.ID, "claimed", map[string]any{"status": map[string]any{"old": "todo", "new": "doing"}}); err != nil {
+		return model.WorkDelivery{}, false, err
+	}
+	t.Status = "doing"
+	t.Version++
+	t.UpdatedAt = now
+	t, results, err := taskWithDependencyResults(ctx, tx, t)
+	if err != nil {
+		return model.WorkDelivery{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return model.WorkDelivery{}, false, err
+	}
+	return model.WorkDelivery{Delivery: "claimed", Task: t, DependencyResults: results}, true, nil
+}
+
+// CompleteWork atomically completes service-owned work. Identical terminal
+// replays are successful and do not append duplicate events.
+func (s *Store) CompleteWork(ctx context.Context, actor model.Actor, id, status, result string) (model.Task, error) {
+	if !actor.IsService() {
+		return model.Task{}, ErrServiceActorRequired
+	}
+	if status != "done" && status != "failed" {
+		return model.Task{}, fmt.Errorf("%w: status must be done or failed", ErrInvalid)
+	}
+	if len(result) > 20000 {
+		return model.Task{}, fmt.Errorf("%w: result is too long", ErrInvalid)
+	}
+	result = strings.TrimSpace(result)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return model.Task{}, err
+	}
+	defer tx.Rollback()
+	old, err := taskByID(ctx, tx, id)
+	if err != nil {
+		return model.Task{}, err
+	}
+	if old.AssignedTo != actor.ID {
+		return model.Task{}, ErrWorkNotOwned
+	}
+	if old.Terminal() {
+		if old.Status == status && old.Result == result {
+			if err = hydrateTask(ctx, tx, &old); err != nil {
+				return model.Task{}, err
+			}
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+				return model.Task{}, err
+			}
+			return old, nil
+		}
+		return model.Task{}, ErrCompletionConflict
+	}
+	if old.Status != "doing" {
+		return model.Task{}, ErrWorkNotOwned
+	}
+	blocked, err := blockedTx(ctx, tx, id)
+	if err != nil {
+		return model.Task{}, err
+	}
+	if blocked {
+		return model.Task{}, ErrBlocked
+	}
+	now := time.Now().UTC()
+	updated, err := tx.ExecContext(ctx, `UPDATE tasks SET status=?,result=?,version=version+1,updated_at=? WHERE id=? AND assigned_to=? AND status='doing'`, status, result, stamp(now), id, actor.ID)
+	if err != nil {
+		return model.Task{}, err
+	}
+	n, _ := updated.RowsAffected()
+	if n != 1 {
+		return model.Task{}, ErrWorkNotOwned
+	}
+	changes := map[string]any{"status": map[string]any{"old": "doing", "new": status}}
+	if result != "" {
+		changes["result"] = map[string]any{"changed": true}
+	}
+	if err := addEvent(ctx, tx, id, actor.ID, "completed", changes); err != nil {
+		return model.Task{}, err
+	}
+	old.Status = status
+	old.Result = result
+	old.Version++
+	old.UpdatedAt = now
+	if err = hydrateTask(ctx, tx, &old); err != nil {
+		return model.Task{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return model.Task{}, err
+	}
+	return old, nil
 }
 
 func encodeCursor(t time.Time, id string) string {

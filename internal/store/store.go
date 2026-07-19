@@ -21,12 +21,17 @@ import (
 )
 
 var (
-	ErrNotFound     = errors.New("not found")
-	ErrForbidden    = errors.New("forbidden")
-	ErrConflict     = errors.New("conflict")
-	ErrInvalid      = errors.New("invalid")
-	ErrBlocked      = errors.New("task is blocked")
-	ErrPrecondition = errors.New("precondition failed")
+	ErrNotFound             = errors.New("not found")
+	ErrForbidden            = errors.New("forbidden")
+	ErrConflict             = errors.New("conflict")
+	ErrInvalid              = errors.New("invalid")
+	ErrInvalidProject       = errors.New("invalid project")
+	ErrBlocked              = errors.New("task is blocked")
+	ErrPrecondition         = errors.New("precondition failed")
+	ErrServiceActorRequired = errors.New("service actor required")
+	ErrWorkNotOwned         = errors.New("work not owned")
+	ErrCompletionConflict   = errors.New("completion conflict")
+	ErrAmbiguousActiveWork  = errors.New("ambiguous active work")
 )
 
 //go:embed migrations/*.sql

@@ -13,7 +13,8 @@ type Actor struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
-func (a Actor) IsAdmin() bool { return a.Active && a.Kind == "human" && a.Role == "admin" }
+func (a Actor) IsAdmin() bool   { return a.Active && a.Kind == "human" && a.Role == "admin" }
+func (a Actor) IsService() bool { return a.Active && a.Kind == "service" }
 
 type APIToken struct {
 	ID         string     `json:"id"`
@@ -40,7 +41,7 @@ type Task struct {
 	ID          string    `json:"id"`
 	Title       string    `json:"title"`
 	Description string    `json:"description"`
-	ProjectID   string    `json:"project_id,omitempty"`
+	ProjectID   string    `json:"project_id"`
 	CreatedBy   string    `json:"created_by"`
 	AssignedTo  string    `json:"assigned_to"`
 	Status      string    `json:"status"`
@@ -87,4 +88,16 @@ type TaskFilter struct {
 type TaskPage struct {
 	Data       []Task `json:"data"`
 	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+type DependencyResult struct {
+	TaskID string `json:"task_id"`
+	Title  string `json:"title"`
+	Result string `json:"result"`
+}
+
+type WorkDelivery struct {
+	Delivery          string             `json:"delivery"`
+	Task              Task               `json:"task"`
+	DependencyResults []DependencyResult `json:"dependency_results"`
 }

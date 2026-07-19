@@ -1,4 +1,4 @@
-# Agent guide
+# Service worker guide
 
 ## Startup contract
 
@@ -9,82 +9,90 @@ export TASK_BOARD_URL=https://task-board.oorangy.com
 export TASK_BOARD_TOKEN='the-token-shown-by-an-administrator'
 ```
 
-Verify identity before doing anything else:
+Verify identity before requesting work:
 
 ```sh
-curl --fail --silent \
+curl --fail-with-body --silent --show-error \
   -H "Authorization: Bearer $TASK_BOARD_TOKEN" \
   "$TASK_BOARD_URL/api/v1/whoami"
 ```
 
-Stop if the returned username is not the expected actor. A 401 means the token is missing,
-expired, revoked, or its actor has been disabled.
+Stop unless the response is the expected active service actor. A 401 means the token is missing,
+expired, revoked, or belongs to a disabled actor.
 
-## Find work
+## Become ready for project work
 
-List tasks assigned to the verified actor using its returned `id`:
+Call ready only when the local project worker is prepared to own work:
 
 ```sh
-curl --fail --silent --get \
+curl --fail-with-body --silent --show-error -X POST \
   -H "Authorization: Bearer $TASK_BOARD_TOKEN" \
-  --data-urlencode "assigned_to=$ACTOR_ID" \
-  --data-urlencode "status=todo" \
-  --data-urlencode "status=doing" \
+  -H 'Content-Type: application/json' \
+  -d '{"project_id":"PROJECT_UUID"}' \
+  "$TASK_BOARD_URL/api/v1/work/ready"
+```
+
+The response is one of:
+
+- `200` with `delivery: "claimed"`: the oldest actionable assigned task was atomically moved to
+  `doing` and is now owned by this system.
+- `200` with `delivery: "resumed"`: this system already owns the returned `doing` task and must
+  recover it rather than claim another.
+- `204`: there is no owned or actionable work. Do not invoke an LLM or executor.
+
+The delivery contains only valid work assigned to the token actor for the requested project. It
+also contains the results of direct completed dependencies. Service actors cannot browse task
+collections or fetch task details separately.
+
+## Complete owned work
+
+Report success or genuine failure through the worker completion route:
+
+```sh
+curl --fail-with-body --silent --show-error -X POST \
+  -H "Authorization: Bearer $TASK_BOARD_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"done","result":"Created commit abc123"}' \
+  "$TASK_BOARD_URL/api/v1/work/TASK_UUID/complete"
+```
+
+`status` must be `done` or `failed`. `result` is optional, should be concise, and may contain a
+commit ID, URL, shared-storage path, or artifact identifier. It must not contain credentials.
+
+An identical completion retry is safe. A `completion_conflict` means another terminal outcome was
+already recorded. `work_not_owned` means the task is not current work owned by this service.
+
+Exactly one component should report completion. Do not let both a wrapper and its invoked
+skill/script complete the same task independently.
+
+## Delegate or schedule continuation work
+
+Resolve active actor and project IDs from `/api/v1/actors` and `/api/v1/projects`. Create every task
+with a project and a stable, operation-specific idempotency key:
+
+```sh
+curl --fail-with-body --silent --show-error -X POST \
+  -H "Authorization: Bearer $TASK_BOARD_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $CURRENT_TASK_ID:delegate-report" \
+  -d '{"title":"Generate report","project_id":"PROJECT_UUID","assigned_to":"PEER_ACTOR_UUID"}' \
   "$TASK_BOARD_URL/api/v1/tasks"
 ```
 
-Prefer tasks with `actionable: true`. `is_blocked: true` means at least one dependency is not
-done. Do not work around a block by changing the dependency unless the task instructions and your
-authority explicitly call for it.
+A service may create a task for a peer and then create a self-assigned continuation blocked by the
+peer task. When the peer finishes, its result is included automatically when the continuation is
+delivered. Task Board does not provide service actors with later browse/edit access to delegated
+tasks; humans handle exceptional cancellation or cleanup.
 
-## Read before changing
+Never send `created_by`; the server derives it from the token. Reuse an idempotency key only with
+the identical request body.
 
-`GET /api/v1/tasks/{id}` returns both the task and its event history. The response ETag and task
-`version` represent the current revision.
+## Recovery and external effects
 
-Update using that version:
+Persist enough local state to recover any delivered task. A repeated ready call redelivers current
+owned work, but Task Board cannot determine whether an email, upload, purchase, or other external
+effect already happened. Use operation-specific idempotency in project skills and APIs. If safe
+recovery is impossible, complete the task as `failed` with a useful result.
 
-```sh
-curl --fail --silent -X PATCH \
-  -H "Authorization: Bearer $TASK_BOARD_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -H 'If-Match: "3"' \
-  -d '{"status":"doing"}' \
-  "$TASK_BOARD_URL/api/v1/tasks/$TASK_ID"
-```
-
-A 412 response means somebody changed the task. Fetch it again and reconsider the update. Never
-blindly increment or retry the old body.
-
-When finishing, send status and result together. Use `done` for success and `failed` when the work
-was attempted but could not succeed. Results should be concise and may contain repository paths,
-commit IDs, or URLs. They must not contain credentials.
-
-## Create work safely
-
-Use a stable, operation-specific `Idempotency-Key` so retries do not duplicate tasks:
-
-```sh
-curl --fail --silent -X POST \
-  -H "Authorization: Bearer $TASK_BOARD_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -H "Idempotency-Key: $RUN_ID:create-follow-up" \
-  -d '{"title":"Review generated report","assigned_to":"ACTOR_UUID"}' \
-  "$TASK_BOARD_URL/api/v1/tasks"
-```
-
-The token determines `created_by`. Supplying that field is rejected. Idempotency keys last 24
-hours and may not be reused with a different request body.
-
-## Error handling
-
-Errors use `application/problem+json` and include a stable `code`:
-
-- `authentication_required` / `invalid_token`: stop and request credential help.
-- `invalid_token`: stop; the token may be revoked or its actor administratively disabled.
-- `validation_failed`: fix the request rather than retrying unchanged.
-- `task_blocked`: fetch blocker state and wait or report the block.
-- `version_conflict`: fetch, reconsider, and retry only if still appropriate.
-- `forbidden`: the current actor does not own that mutation.
-
-The complete contract is at `/api/v1/openapi.json` and the conventions are in `/docs/api.md`.
+The authoritative protocol and acceptance scenarios are in
+[`worker-contract.md`](worker-contract.md). Exact API shapes are in `/api/v1/openapi.json`.

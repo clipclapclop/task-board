@@ -21,7 +21,9 @@ go run ./cmd/task-board token create --actor example-agent --name local-developm
 ```
 
 Store the returned token in `TASK_BOARD_TOKEN`; it is shown only once. Begin every agent session
-with `GET /api/v1/whoami`.
+with `GET /api/v1/whoami`. Service actors receive project work through
+`POST /api/v1/work/ready` and report it through `POST /api/v1/work/{task_id}/complete`; they do not
+browse the general task API.
 
 ## Verification
 
@@ -31,6 +33,6 @@ go vet ./...
 go build ./cmd/task-board
 ```
 
-See [agent usage](docs/agents.md), [API conventions](docs/api.md), and
-[ContainerBot operations](docs/operations.md). The authoritative product scope is in
-[task-board-requirements.md](task-board-requirements.md).
+See the [worker contract](docs/worker-contract.md), [agent usage](docs/agents.md),
+[API conventions](docs/api.md), and [ContainerBot operations](docs/operations.md). The
+authoritative product scope is in [task-board-requirements.md](task-board-requirements.md).
