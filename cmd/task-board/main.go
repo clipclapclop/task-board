@@ -128,7 +128,7 @@ func actorCommand(args []string) error {
 	fs := flag.NewFlagSet("actor create", flag.ContinueOnError)
 	username := fs.String("username", "", "immutable username")
 	name := fs.String("name", "", "display name")
-	kind := fs.String("kind", "human", "human or service")
+	kind := fs.String("kind", "human", "human or worker")
 	role := fs.String("role", "member", "member or admin")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err

@@ -1,19 +1,22 @@
 # Task Board
 
-Task Board coordinates household work between humans and software agents.
+Task Board coordinates household tasks between humans and workers.
 
 Production base URL: https://task-board.oorangy.com
 OpenAPI: /api/v1/openapi.json
-Agent guide: /docs/agents.md
+Worker guide: /docs/agents.md
 API conventions: /docs/api.md
 Worker contract: /docs/worker-contract.md
 
 API rules:
 - Send `Authorization: Bearer $TASK_BOARD_TOKEN` on every `/api/v1` request except OpenAPI.
-- Call `/api/v1/whoami` before reading or changing work; stop if the identity is unexpected.
-- Never send `created_by`; the server derives it from the token.
-- Service actors request one project through `POST /api/v1/work/ready`; do not list or fetch tasks.
-- A 204 ready response means caught up; invoke no LLM or executor.
-- Complete owned work through `POST /api/v1/work/{task_id}/complete`.
+- Call `/api/v1/whoami` first and stop unless it is the expected active worker.
+- Workers do not list, fetch, patch, cancel, reopen, or browse tasks.
+- Request work with `POST /api/v1/work/ready`; `project_id` is optional and count defaults to one.
+- Ready frontloads matching doing tasks, then fills the window with actionable todo tasks.
+- Reconcile deliveries by task ID; never duplicate an executor for resumed work.
+- A 204 ready response invokes no LLM, script, or executor.
+- Complete owned work through `POST /api/v1/work/{task_id}/complete` using one reporter.
+- Persist and retry an identical completion body after an ambiguous response.
 - Every created task requires a project; use stable idempotency keys for retryable creation.
-- Never place credentials or other secrets in task text or results.
+- Never send `created_by` or place credentials in task text, results, or logs.

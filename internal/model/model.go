@@ -13,8 +13,8 @@ type Actor struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
-func (a Actor) IsAdmin() bool   { return a.Active && a.Kind == "human" && a.Role == "admin" }
-func (a Actor) IsService() bool { return a.Active && a.Kind == "service" }
+func (a Actor) IsAdmin() bool  { return a.Active && a.Kind == "human" && a.Role == "admin" }
+func (a Actor) IsWorker() bool { return a.Active && a.Kind == "worker" }
 
 type APIToken struct {
 	ID         string     `json:"id"`
@@ -38,20 +38,21 @@ type Project struct {
 }
 
 type Task struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
-	ProjectID   string    `json:"project_id"`
-	CreatedBy   string    `json:"created_by"`
-	AssignedTo  string    `json:"assigned_to"`
-	Status      string    `json:"status"`
-	Result      string    `json:"result"`
-	Version     int64     `json:"version"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	BlockedBy   []TaskRef `json:"blocked_by"`
-	IsBlocked   bool      `json:"is_blocked"`
-	Actionable  bool      `json:"actionable"`
+	ID            string    `json:"id"`
+	Title         string    `json:"title"`
+	Description   string    `json:"description"`
+	ProjectID     string    `json:"project_id"`
+	CreatedBy     string    `json:"created_by"`
+	AssignedTo    string    `json:"assigned_to"`
+	Status        string    `json:"status"`
+	Result        string    `json:"result"`
+	QueueSequence int64     `json:"queue_sequence"`
+	Version       int64     `json:"version"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	BlockedBy     []TaskRef `json:"blocked_by"`
+	IsBlocked     bool      `json:"is_blocked"`
+	Actionable    bool      `json:"actionable"`
 }
 
 func (t Task) Terminal() bool {
@@ -96,8 +97,14 @@ type DependencyResult struct {
 	Result string `json:"result"`
 }
 
-type WorkDelivery struct {
+type TaskDelivery struct {
 	Delivery          string             `json:"delivery"`
 	Task              Task               `json:"task"`
 	DependencyResults []DependencyResult `json:"dependency_results"`
+}
+
+type ReadyResponse struct {
+	ProjectID  string         `json:"project_id,omitempty"`
+	Count      int            `json:"count"`
+	Deliveries []TaskDelivery `json:"deliveries"`
 }

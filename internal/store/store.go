@@ -21,17 +21,18 @@ import (
 )
 
 var (
-	ErrNotFound             = errors.New("not found")
-	ErrForbidden            = errors.New("forbidden")
-	ErrConflict             = errors.New("conflict")
-	ErrInvalid              = errors.New("invalid")
-	ErrInvalidProject       = errors.New("invalid project")
-	ErrBlocked              = errors.New("task is blocked")
-	ErrPrecondition         = errors.New("precondition failed")
-	ErrServiceActorRequired = errors.New("service actor required")
-	ErrWorkNotOwned         = errors.New("work not owned")
-	ErrCompletionConflict   = errors.New("completion conflict")
-	ErrAmbiguousActiveWork  = errors.New("ambiguous active work")
+	ErrNotFound              = errors.New("not found")
+	ErrForbidden             = errors.New("forbidden")
+	ErrConflict              = errors.New("conflict")
+	ErrInvalid               = errors.New("invalid")
+	ErrInvalidProject        = errors.New("invalid project")
+	ErrBlocked               = errors.New("task is blocked")
+	ErrPrecondition          = errors.New("precondition failed")
+	ErrWorkerRequired        = errors.New("worker required")
+	ErrInvalidCount          = errors.New("invalid count")
+	ErrWorkNotOwned          = errors.New("work not owned")
+	ErrCompletionConflict    = errors.New("completion conflict")
+	ErrQueueSequenceConflict = errors.New("queue sequence conflict")
 )
 
 //go:embed migrations/*.sql
@@ -153,6 +154,9 @@ func scanActor(row interface{ Scan(...any) error }) (model.Actor, error) {
 	if err != nil {
 		return a, err
 	}
+	if a.Kind == "service" {
+		a.Kind = "worker"
+	}
 	a.Active, a.CreatedAt, a.UpdatedAt = active == 1, parseTime(created), parseTime(updated)
 	return a, nil
 }
@@ -180,14 +184,14 @@ func validateActor(a model.Actor) error {
 			return fmt.Errorf("%w: username must be lowercase letters, digits, '-' or '_'", ErrInvalid)
 		}
 	}
-	if a.Kind != "human" && a.Kind != "service" {
+	if a.Kind != "human" && a.Kind != "worker" {
 		return fmt.Errorf("%w: invalid actor kind", ErrInvalid)
 	}
 	if a.Role != "member" && a.Role != "admin" {
 		return fmt.Errorf("%w: invalid role", ErrInvalid)
 	}
-	if a.Kind == "service" && a.Role == "admin" {
-		return fmt.Errorf("%w: service actors cannot be administrators", ErrInvalid)
+	if a.Kind == "worker" && a.Role == "admin" {
+		return fmt.Errorf("%w: workers cannot be administrators", ErrInvalid)
 	}
 	return nil
 }
@@ -202,8 +206,12 @@ func (s *Store) CreateActor(ctx context.Context, a model.Actor) (model.Actor, er
 	}
 	now := time.Now().UTC()
 	a.ID, a.CreatedAt, a.UpdatedAt = id, now, now
+	storageKind := a.Kind
+	if storageKind == "worker" {
+		storageKind = "service"
+	}
 	_, err = s.DB.ExecContext(ctx, `INSERT INTO actors(id,username,display_name,kind,role,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`,
-		a.ID, a.Username, strings.TrimSpace(a.DisplayName), a.Kind, a.Role, boolInt(a.Active), stamp(now), stamp(now))
+		a.ID, a.Username, strings.TrimSpace(a.DisplayName), storageKind, a.Role, boolInt(a.Active), stamp(now), stamp(now))
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return model.Actor{}, fmt.Errorf("%w: username already exists", ErrConflict)
@@ -377,6 +385,9 @@ func (s *Store) AuthenticateToken(ctx context.Context, secret string) (model.Act
 		return model.Actor{}, err
 	}
 	a.Active = true
+	if a.Kind == "service" {
+		a.Kind = "worker"
+	}
 	a.CreatedAt = parseTime(created)
 	a.UpdatedAt = parseTime(updated)
 	_, _ = s.DB.ExecContext(ctx, `UPDATE api_tokens SET last_used_at=? WHERE id=? AND (last_used_at IS NULL OR last_used_at<?)`, stamp(now), tokenID, stamp(now.Add(-time.Minute)))

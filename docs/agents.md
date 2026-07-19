@@ -1,15 +1,19 @@
-# Service worker guide
+# Worker guide
 
-## Startup contract
+A worker is the HTTP API client that receives and completes tasks. Give each independently
+coordinated deployment its own worker actor and token; do not share a token between processes that
+do not share one local coordinator.
 
-Set these values outside source control:
+## Verify identity
+
+Set the URL and token outside source control:
 
 ```sh
 export TASK_BOARD_URL=https://task-board.oorangy.com
 export TASK_BOARD_TOKEN='the-token-shown-by-an-administrator'
 ```
 
-Verify identity before requesting work:
+Before requesting work:
 
 ```sh
 curl --fail-with-body --silent --show-error \
@@ -17,36 +21,39 @@ curl --fail-with-body --silent --show-error \
   "$TASK_BOARD_URL/api/v1/whoami"
 ```
 
-Stop unless the response is the expected active service actor. A 401 means the token is missing,
-expired, revoked, or belongs to a disabled actor.
+Stop unless the response is the expected active actor with `kind: "worker"`. A 401 means the
+token is missing, expired, revoked, or belongs to a disabled actor.
 
-## Become ready for project work
+## Request a ready window
 
-Call ready only when the local project worker is prepared to own work:
+Call ready only when local scheduling policy permits the worker to own the returned window:
 
 ```sh
 curl --fail-with-body --silent --show-error -X POST \
   -H "Authorization: Bearer $TASK_BOARD_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"project_id":"PROJECT_UUID"}' \
+  -d '{"count":3}' \
   "$TASK_BOARD_URL/api/v1/work/ready"
 ```
 
-The response is one of:
+Add `"project_id":"PROJECT_UUID"` only when intentionally limiting the scope. Count defaults to
+one and may be 1 through 32. It is the returned window size, not additional demand or global
+capacity.
 
-- `200` with `delivery: "claimed"`: the oldest actionable assigned task was atomically moved to
-  `doing` and is now owned by this system.
-- `200` with `delivery: "resumed"`: this system already owns the returned `doing` task and must
-  recover it rather than claim another.
-- `204`: there is no owned or actionable work. Do not invoke an LLM or executor.
+A 200 response contains a `deliveries` array. Matching `doing` tasks appear first in immutable
+queue order with `delivery: "resumed"`; actionable `todo` tasks fill unused positions with
+`delivery: "claimed"`. Reconcile by task ID. Never launch a second executor for a resumed task.
 
-The delivery contains only valid work assigned to the token actor for the requested project. It
-also contains the results of direct completed dependencies. Service actors cannot browse task
-collections or fetch task details separately.
+A 204 response means no matching owned or actionable work exists. Do not invoke an LLM, script,
+or executor. On cold start, use an unfiltered request and conservative count when prior ownership
+is uncertain. Locally track owned tasks outside the current project or count window.
+
+Each delivery includes only the results of direct completed blockers. Workers cannot fetch task
+details or browse tasks separately.
 
 ## Complete owned work
 
-Report success or genuine failure through the worker completion route:
+Report success or genuine execution failure individually, in any order:
 
 ```sh
 curl --fail-with-body --silent --show-error -X POST \
@@ -56,43 +63,43 @@ curl --fail-with-body --silent --show-error -X POST \
   "$TASK_BOARD_URL/api/v1/work/TASK_UUID/complete"
 ```
 
-`status` must be `done` or `failed`. `result` is optional, should be concise, and may contain a
-commit ID, URL, shared-storage path, or artifact identifier. It must not contain credentials.
+`result` is optional, concise, and at most 20,000 characters. It may contain a commit ID, URL,
+shared-storage path, artifact identifier, or answer, but never credentials.
 
-An identical completion retry is safe. A `completion_conflict` means another terminal outcome was
-already recorded. `work_not_owned` means the task is not current work owned by this service.
+Persist the exact completion body until acknowledged. An identical retry is safe after an
+ambiguous response. Do not change the outcome while acknowledgement is unknown. Stop and
+reconcile `completion_conflict`, `work_not_owned`, or other stable 4xx responses. Give each task
+exactly one completion reporter; do not let both a wrapper and its executor complete it.
 
-Exactly one component should report completion. Do not let both a wrapper and its invoked
-skill/script complete the same task independently.
+## Delegate or create a continuation
 
-## Delegate or schedule continuation work
-
-Resolve active actor and project IDs from `/api/v1/actors` and `/api/v1/projects`. Create every task
-with a project and a stable, operation-specific idempotency key:
+Resolve active IDs from `/api/v1/actors` and `/api/v1/projects`. Every task requires a project and
+a human or worker assignee. Never send `created_by`; the server derives it from the token. Use a
+stable operation-specific idempotency key:
 
 ```sh
 curl --fail-with-body --silent --show-error -X POST \
   -H "Authorization: Bearer $TASK_BOARD_TOKEN" \
   -H 'Content-Type: application/json' \
   -H "Idempotency-Key: $CURRENT_TASK_ID:delegate-report" \
-  -d '{"title":"Generate report","project_id":"PROJECT_UUID","assigned_to":"PEER_ACTOR_UUID"}' \
+  -d '{"title":"Generate report","project_id":"PROJECT_UUID","assigned_to":"PEER_WORKER_UUID"}' \
   "$TASK_BOARD_URL/api/v1/tasks"
 ```
 
-A service may create a task for a peer and then create a self-assigned continuation blocked by the
-peer task. When the peer finishes, its result is included automatically when the continuation is
-delivered. Task Board does not provide service actors with later browse/edit access to delegated
-tasks; humans handle exceptional cancellation or cleanup.
-
-Never send `created_by`; the server derives it from the token. Reuse an idempotency key only with
-the identical request body.
+Persist the returned task ID. For a peer handoff, create peer work first, then create a
+self-assigned continuation blocked by the peer task ID. When the peer succeeds, its direct result
+will accompany the continuation's ready delivery. A worker cannot later browse the delegated
+task; humans handle exceptional cancellation or cleanup.
 
 ## Recovery and external effects
 
-Persist enough local state to recover any delivered task. A repeated ready call redelivers current
-owned work, but Task Board cannot determine whether an email, upload, purchase, or other external
-effect already happened. Use operation-specific idempotency in project skills and APIs. If safe
-recovery is impossible, complete the task as `failed` with a useful result.
+Persist task identity before effects, plus executor progress and pending completion state. Treat
+delivery as at-least-once. For external operations that must not repeat, use task ID plus the
+logical operation as a project-specific idempotency key. A restart alone is not a task failure.
 
-The authoritative protocol and acceptance scenarios are in
-[`worker-contract.md`](worker-contract.md). Exact API shapes are in `/api/v1/openapi.json`.
+Stop asking for new work during graceful shutdown. Use bounded transport timeouts and retry
+server/network failures with backoff and jitter. Log worker, task, project, queue sequence,
+delivery type, and outcome without tokens or sensitive task content.
+
+The normative protocol and acceptance scenarios are in
+[`worker-contract.md`](worker-contract.md). Exact schemas are in `/api/v1/openapi.json`.

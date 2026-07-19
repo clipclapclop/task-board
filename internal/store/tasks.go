@@ -24,13 +24,14 @@ type CreateTaskInput struct {
 }
 
 type PatchTaskInput struct {
-	Title       *string   `json:"title,omitempty"`
-	Description *string   `json:"description,omitempty"`
-	ProjectID   *string   `json:"project_id,omitempty"`
-	AssignedTo  *string   `json:"assigned_to,omitempty"`
-	Status      *string   `json:"status,omitempty"`
-	Result      *string   `json:"result,omitempty"`
-	BlockedBy   *[]string `json:"blocked_by,omitempty"`
+	Title         *string   `json:"title,omitempty"`
+	Description   *string   `json:"description,omitempty"`
+	ProjectID     *string   `json:"project_id,omitempty"`
+	AssignedTo    *string   `json:"assigned_to,omitempty"`
+	Status        *string   `json:"status,omitempty"`
+	Result        *string   `json:"result,omitempty"`
+	BlockedBy     *[]string `json:"blocked_by,omitempty"`
+	QueueSequence *int64    `json:"queue_sequence,omitempty"`
 }
 
 type queryRow interface {
@@ -41,12 +42,12 @@ type queryRows interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-const taskColumns = `id,title,description,COALESCE(project_id,''),created_by,assigned_to,status,result,version,created_at,updated_at`
+const taskColumns = `id,title,description,COALESCE(project_id,''),created_by,assigned_to,status,result,queue_sequence,version,created_at,updated_at`
 
 func scanTask(row interface{ Scan(...any) error }) (model.Task, error) {
 	var t model.Task
 	var created, updated string
-	err := row.Scan(&t.ID, &t.Title, &t.Description, &t.ProjectID, &t.CreatedBy, &t.AssignedTo, &t.Status, &t.Result, &t.Version, &created, &updated)
+	err := row.Scan(&t.ID, &t.Title, &t.Description, &t.ProjectID, &t.CreatedBy, &t.AssignedTo, &t.Status, &t.Result, &t.QueueSequence, &t.Version, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return t, ErrNotFound
 	}
@@ -78,7 +79,7 @@ func hydrateTask(ctx context.Context, q queryRows, t *model.Task) error {
 			t.IsBlocked = true
 		}
 	}
-	t.Actionable = !t.Terminal() && !t.IsBlocked
+	t.Actionable = t.Status == "todo" && !t.IsBlocked
 	return rows.Err()
 }
 
@@ -157,6 +158,12 @@ func addEvent(ctx context.Context, tx *sql.Tx, taskID, actorID, eventType string
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO task_events(id,task_id,actor_id,event_type,changes_json,created_at) VALUES(?,?,?,?,?,?)`, id, taskID, actorID, eventType, string(body), stamp(time.Now()))
 	return err
+}
+
+func nextQueueSequence(ctx context.Context, tx *sql.Tx) (int64, error) {
+	var sequence int64
+	err := tx.QueryRowContext(ctx, `UPDATE task_queue_counter SET value=value+1 WHERE id=1 RETURNING value`).Scan(&sequence)
+	return sequence, err
 }
 
 func setDependencies(ctx context.Context, tx *sql.Tx, taskID string, deps []string) error {
@@ -241,11 +248,15 @@ func (s *Store) CreateTask(ctx context.Context, actor model.Actor, in CreateTask
 	if err = activeProjectTx(ctx, tx, in.ProjectID); err != nil {
 		return model.Task{}, false, err
 	}
+	queueSequence, err := nextQueueSequence(ctx, tx)
+	if err != nil {
+		return model.Task{}, false, err
+	}
 	var project any
 	if in.ProjectID != "" {
 		project = in.ProjectID
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO tasks(id,title,description,project_id,created_by,assigned_to,status,result,version,created_at,updated_at) VALUES(?,?,?,?,?,?,'todo','',1,?,?)`, id, strings.TrimSpace(in.Title), strings.TrimSpace(in.Description), project, actor.ID, in.AssignedTo, stamp(now), stamp(now))
+	_, err = tx.ExecContext(ctx, `INSERT INTO tasks(id,title,description,project_id,created_by,assigned_to,status,result,queue_sequence,version,created_at,updated_at) VALUES(?,?,?,?,?,?,'todo','',?,1,?,?)`, id, strings.TrimSpace(in.Title), strings.TrimSpace(in.Description), project, actor.ID, in.AssignedTo, queueSequence, stamp(now), stamp(now))
 	if err != nil {
 		return model.Task{}, false, err
 	}
@@ -278,8 +289,11 @@ func (s *Store) PatchTask(ctx context.Context, actor model.Actor, id string, exp
 	if !actor.Active {
 		return model.Task{}, ErrForbidden
 	}
-	if actor.IsService() {
+	if actor.IsWorker() {
 		return model.Task{}, ErrForbidden
+	}
+	if in.QueueSequence != nil {
+		return model.Task{}, ErrQueueSequenceConflict
 	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -498,88 +512,127 @@ func taskWithDependencyResults(ctx context.Context, q queryRows, task model.Task
 		task.BlockedBy = append(task.BlockedBy, model.TaskRef{ID: result.TaskID, Title: result.Title, Status: "done"})
 	}
 	task.IsBlocked = false
-	task.Actionable = !task.Terminal()
+	task.Actionable = false
 	return task, results, nil
 }
 
-// ReadyWork redelivers the oldest work already owned by the service actor for
-// the project, or atomically claims the oldest actionable todo task.
-func (s *Store) ReadyWork(ctx context.Context, actor model.Actor, projectID string) (model.WorkDelivery, bool, error) {
-	if !actor.IsService() {
-		return model.WorkDelivery{}, false, ErrServiceActorRequired
+// ReadyWork returns a status-first window of work assigned to the worker. It
+// redelivers doing tasks before atomically claiming actionable todo tasks.
+func (s *Store) ReadyWork(ctx context.Context, actor model.Actor, projectID string, count int) (model.ReadyResponse, bool, error) {
+	response := model.ReadyResponse{ProjectID: strings.TrimSpace(projectID), Count: count, Deliveries: []model.TaskDelivery{}}
+	if !actor.IsWorker() {
+		return response, false, ErrWorkerRequired
 	}
-	projectID = strings.TrimSpace(projectID)
+	if count < 1 || count > 32 {
+		return response, false, ErrInvalidCount
+	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return model.WorkDelivery{}, false, err
+		return response, false, err
 	}
 	defer tx.Rollback()
-	if err := activeProjectTx(ctx, tx, projectID); err != nil {
-		return model.WorkDelivery{}, false, err
-	}
-	var doingCount int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE assigned_to=? AND project_id=? AND status='doing'`, actor.ID, projectID).Scan(&doingCount); err != nil {
-		return model.WorkDelivery{}, false, err
-	}
-	if doingCount > 1 {
-		return model.WorkDelivery{}, false, ErrAmbiguousActiveWork
-	}
-	if doingCount == 1 {
-		t, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskColumns+` FROM tasks WHERE assigned_to=? AND project_id=? AND status='doing' ORDER BY created_at,id LIMIT 1`, actor.ID, projectID))
-		if err != nil {
-			return model.WorkDelivery{}, false, err
+	if response.ProjectID != "" {
+		if err := activeProjectTx(ctx, tx, response.ProjectID); err != nil {
+			return response, false, err
 		}
-		t, results, err := taskWithDependencyResults(ctx, tx, t)
-		if err != nil {
-			return model.WorkDelivery{}, false, err
-		}
-		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			return model.WorkDelivery{}, false, err
-		}
-		return model.WorkDelivery{Delivery: "resumed", Task: t, DependencyResults: results}, true, nil
 	}
 
-	row := tx.QueryRowContext(ctx, `SELECT `+taskColumns+` FROM tasks t
-		WHERE t.assigned_to=? AND t.project_id=? AND t.status='todo'
-		AND NOT EXISTS(SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocked_by_id WHERE d.task_id=t.id AND b.status<>'done')
-		ORDER BY t.created_at,t.id LIMIT 1`, actor.ID, projectID)
-	t, err := scanTask(row)
-	if errors.Is(err, ErrNotFound) {
-		return model.WorkDelivery{}, false, nil
+	projectClause := ""
+	args := []any{actor.ID}
+	if response.ProjectID != "" {
+		projectClause = " AND project_id=?"
+		args = append(args, response.ProjectID)
 	}
+	args = append(args, count)
+	rows, err := tx.QueryContext(ctx, `SELECT `+taskColumns+` FROM tasks WHERE assigned_to=? AND status='doing'`+projectClause+` ORDER BY queue_sequence LIMIT ?`, args...)
 	if err != nil {
-		return model.WorkDelivery{}, false, err
+		return response, false, err
 	}
+	var doing []model.Task
+	for rows.Next() {
+		t, scanErr := scanTask(rows)
+		if scanErr != nil {
+			rows.Close()
+			return response, false, scanErr
+		}
+		doing = append(doing, t)
+	}
+	if err := rows.Close(); err != nil {
+		return response, false, err
+	}
+
+	remaining := count - len(doing)
+	var claimed []model.Task
+	if remaining > 0 {
+		args = []any{actor.ID}
+		if response.ProjectID != "" {
+			args = append(args, response.ProjectID)
+		}
+		args = append(args, remaining)
+		rows, err = tx.QueryContext(ctx, `SELECT `+taskColumns+` FROM tasks t
+			WHERE t.assigned_to=? AND t.status='todo'`+projectClause+`
+			AND NOT EXISTS(SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocked_by_id WHERE d.task_id=t.id AND b.status<>'done')
+			ORDER BY t.queue_sequence LIMIT ?`, args...)
+		if err != nil {
+			return response, false, err
+		}
+		for rows.Next() {
+			t, scanErr := scanTask(rows)
+			if scanErr != nil {
+				rows.Close()
+				return response, false, scanErr
+			}
+			claimed = append(claimed, t)
+		}
+		if err := rows.Close(); err != nil {
+			return response, false, err
+		}
+	}
+
 	now := time.Now().UTC()
-	result, err := tx.ExecContext(ctx, `UPDATE tasks SET status='doing',version=version+1,updated_at=? WHERE id=? AND version=? AND status='todo'`, stamp(now), t.ID, t.Version)
-	if err != nil {
-		return model.WorkDelivery{}, false, err
+	for i := range claimed {
+		result, updateErr := tx.ExecContext(ctx, `UPDATE tasks SET status='doing',version=version+1,updated_at=? WHERE id=? AND version=? AND status='todo'`, stamp(now), claimed[i].ID, claimed[i].Version)
+		if updateErr != nil {
+			return response, false, updateErr
+		}
+		n, _ := result.RowsAffected()
+		if n != 1 {
+			return response, false, ErrPrecondition
+		}
+		if err := addEvent(ctx, tx, claimed[i].ID, actor.ID, "claimed", map[string]any{"status": map[string]any{"old": "todo", "new": "doing"}}); err != nil {
+			return response, false, err
+		}
+		claimed[i].Status = "doing"
+		claimed[i].Version++
+		claimed[i].UpdatedAt = now
 	}
-	n, _ := result.RowsAffected()
-	if n != 1 {
-		return model.WorkDelivery{}, false, ErrPrecondition
+
+	for _, entry := range []struct {
+		delivery string
+		tasks    []model.Task
+	}{{"resumed", doing}, {"claimed", claimed}} {
+		for _, task := range entry.tasks {
+			hydrated, results, hydrateErr := taskWithDependencyResults(ctx, tx, task)
+			if hydrateErr != nil {
+				return response, false, hydrateErr
+			}
+			response.Deliveries = append(response.Deliveries, model.TaskDelivery{Delivery: entry.delivery, Task: hydrated, DependencyResults: results})
+		}
 	}
-	if err := addEvent(ctx, tx, t.ID, actor.ID, "claimed", map[string]any{"status": map[string]any{"old": "todo", "new": "doing"}}); err != nil {
-		return model.WorkDelivery{}, false, err
-	}
-	t.Status = "doing"
-	t.Version++
-	t.UpdatedAt = now
-	t, results, err := taskWithDependencyResults(ctx, tx, t)
-	if err != nil {
-		return model.WorkDelivery{}, false, err
+	if len(response.Deliveries) == 0 {
+		return response, false, nil
 	}
 	if err := tx.Commit(); err != nil {
-		return model.WorkDelivery{}, false, err
+		return response, false, err
 	}
-	return model.WorkDelivery{Delivery: "claimed", Task: t, DependencyResults: results}, true, nil
+	return response, true, nil
 }
 
-// CompleteWork atomically completes service-owned work. Identical terminal
+// CompleteWork atomically completes worker-owned work. Identical terminal
 // replays are successful and do not append duplicate events.
 func (s *Store) CompleteWork(ctx context.Context, actor model.Actor, id, status, result string) (model.Task, error) {
-	if !actor.IsService() {
-		return model.Task{}, ErrServiceActorRequired
+	if !actor.IsWorker() {
+		return model.Task{}, ErrWorkerRequired
 	}
 	if status != "done" && status != "failed" {
 		return model.Task{}, fmt.Errorf("%w: status must be done or failed", ErrInvalid)
@@ -705,7 +758,7 @@ func (s *Store) Tasks(ctx context.Context, f model.TaskFilter) (model.TaskPage, 
 		args = append(args, q, q)
 	}
 	if f.Actionable != nil {
-		clause := `NOT EXISTS(SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocked_by_id WHERE d.task_id=t.id AND b.status<>'done') AND t.status NOT IN ('done','failed','cancelled')`
+		clause := `t.status='todo' AND NOT EXISTS(SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocked_by_id WHERE d.task_id=t.id AND b.status<>'done')`
 		if !*f.Actionable {
 			clause = "NOT (" + clause + ")"
 		}

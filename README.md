@@ -16,14 +16,14 @@ is the production network-access boundary.
 Create an API token for an actor:
 
 ```sh
-go run ./cmd/task-board actor create --username example-agent --name "Example Agent" --kind service
-go run ./cmd/task-board token create --actor example-agent --name local-development
+go run ./cmd/task-board actor create --username example-worker --name "Example Worker" --kind worker
+go run ./cmd/task-board token create --actor example-worker --name local-development
 ```
 
 Store the returned token in `TASK_BOARD_TOKEN`; it is shown only once. Begin every agent session
-with `GET /api/v1/whoami`. Service actors receive project work through
-`POST /api/v1/work/ready` and report it through `POST /api/v1/work/{task_id}/complete`; they do not
-browse the general task API.
+with `GET /api/v1/whoami`. Workers receive status-first ready windows through
+`POST /api/v1/work/ready` and report individual outcomes through
+`POST /api/v1/work/{task_id}/complete`; they do not browse the general task API.
 
 ## Verification
 

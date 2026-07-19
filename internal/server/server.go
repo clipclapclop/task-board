@@ -219,14 +219,16 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 
 func statusFor(err error) (int, string) {
 	switch {
-	case errors.Is(err, store.ErrServiceActorRequired):
-		return 403, "service_actor_required"
+	case errors.Is(err, store.ErrWorkerRequired):
+		return 403, "unsupported_actor_kind"
+	case errors.Is(err, store.ErrInvalidCount):
+		return 422, "invalid_count"
 	case errors.Is(err, store.ErrWorkNotOwned):
 		return 409, "work_not_owned"
 	case errors.Is(err, store.ErrCompletionConflict):
 		return 409, "completion_conflict"
-	case errors.Is(err, store.ErrAmbiguousActiveWork):
-		return 409, "ambiguous_active_work"
+	case errors.Is(err, store.ErrQueueSequenceConflict):
+		return 409, "queue_sequence_conflict"
 	case errors.Is(err, store.ErrInvalidProject):
 		return 422, "invalid_project"
 	case errors.Is(err, store.ErrNotFound):
@@ -286,12 +288,24 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, 200, map[string]any{"data": projects})
 	case r.Method == "POST" && p == "/api/v1/work/ready":
 		var in struct {
-			ProjectID string `json:"project_id"`
+			ProjectID string          `json:"project_id"`
+			Count     json.RawMessage `json:"count"`
 		}
 		if !decodeJSON(w, r, &in) {
 			return
 		}
-		delivery, found, err := s.Store.ReadyWork(r.Context(), a, in.ProjectID)
+		count := 1
+		if len(in.Count) > 0 {
+			if strings.TrimSpace(string(in.Count)) == "null" {
+				problem(w, 422, "invalid_count", "Invalid count", "count must be an integer from 1 through 32.", nil)
+				return
+			}
+			if err := json.Unmarshal(in.Count, &count); err != nil {
+				problem(w, 422, "invalid_count", "Invalid count", "count must be an integer from 1 through 32.", nil)
+				return
+			}
+		}
+		delivery, found, err := s.Store.ReadyWork(r.Context(), a, in.ProjectID, count)
 		if err != nil {
 			storeProblem(w, err)
 			return
@@ -300,7 +314,6 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, delivery.Task.Version))
 		jsonResponse(w, 200, delivery)
 	case r.Method == "POST" && strings.HasPrefix(p, "/api/v1/work/") && strings.HasSuffix(p, "/complete"):
 		var in struct {
@@ -318,8 +331,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, t.Version))
 		jsonResponse(w, 200, t)
 	case r.Method == "GET" && p == "/api/v1/tasks":
-		if a.IsService() {
-			problem(w, 403, "service_task_access_forbidden", "Forbidden", "Service actors receive tasks only through /api/v1/work/ready.", nil)
+		if a.IsWorker() {
+			problem(w, 403, "worker_task_access_forbidden", "Forbidden", "Workers receive tasks only through /api/v1/work/ready.", nil)
 			return
 		}
 		s.apiTasks(w, r)
@@ -339,8 +352,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, t.Version))
 		jsonResponse(w, 201, t)
 	case r.Method == "GET" && strings.HasPrefix(p, "/api/v1/tasks/") && !strings.HasSuffix(p, "/reopen"):
-		if a.IsService() {
-			problem(w, 403, "service_task_access_forbidden", "Forbidden", "Service actors cannot browse task details.", nil)
+		if a.IsWorker() {
+			problem(w, 403, "worker_task_access_forbidden", "Forbidden", "Workers cannot browse task details.", nil)
 			return
 		}
 		id := taskID()
@@ -357,8 +370,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, t.Version))
 		jsonResponse(w, 200, map[string]any{"task": t, "events": events})
 	case r.Method == "PATCH" && strings.HasPrefix(p, "/api/v1/tasks/") && !strings.HasSuffix(p, "/reopen"):
-		if a.IsService() {
-			problem(w, 403, "service_task_access_forbidden", "Forbidden", "Service actors complete owned work through /api/v1/work/{task_id}/complete.", nil)
+		if a.IsWorker() {
+			problem(w, 403, "worker_task_access_forbidden", "Forbidden", "Workers complete owned work through /api/v1/work/{task_id}/complete.", nil)
 			return
 		}
 		id := taskID()
@@ -383,8 +396,8 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, t.Version))
 		jsonResponse(w, 200, t)
 	case r.Method == "POST" && strings.HasSuffix(p, "/reopen"):
-		if a.IsService() {
-			problem(w, 403, "service_task_access_forbidden", "Forbidden", "Service actors cannot reopen tasks.", nil)
+		if a.IsWorker() {
+			problem(w, 403, "worker_task_access_forbidden", "Forbidden", "Workers cannot reopen tasks.", nil)
 			return
 		}
 		id := taskID()

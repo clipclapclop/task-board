@@ -43,7 +43,7 @@ const portalTemplate = `{{define "portal"}}<!doctype html>
 
 {{else if eq .Page "profile"}}<h1>{{.User.DisplayName}}</h1><p><code>{{.User.Username}}</code> · {{.User.Kind}} · {{.User.Role}}</p><section><h2>API tokens</h2><form class="inline" method="post"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><input name="name" required placeholder="Token name"><button name="action" value="create-token">Create token</button></form>{{template "tokens" .}}</section>
 
-{{else if eq .Page "users"}}<div class="title-row"><h1>Users and services</h1><a href="/admin/export">Download export</a></div><div class="cards">{{range .Actors}}<a class="user-card" href="/admin/users/{{.ID}}"><strong>{{.DisplayName}}</strong><span><code>{{.Username}}</code> · {{.Kind}} · {{.Role}}{{if not .Active}} · disabled{{end}}</span></a>{{end}}</div><section><h2>Create actor</h2><form class="stack" method="post"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><div class="grid"><label>Username<input name="username" required pattern="[a-z0-9_-]+"></label><label>Display name<input name="display_name" required></label><label>Kind<select name="kind"><option value="human">human</option><option value="service">service</option></select></label><label>Role<select name="role"><option value="member">member</option><option value="admin">admin</option></select></label></div><button>Create actor</button></form></section>
+{{else if eq .Page "users"}}<div class="title-row"><h1>Users and workers</h1><a href="/admin/export">Download export</a></div><div class="cards">{{range .Actors}}<a class="user-card" href="/admin/users/{{.ID}}"><strong>{{.DisplayName}}</strong><span><code>{{.Username}}</code> · {{.Kind}} · {{.Role}}{{if not .Active}} · disabled{{end}}</span></a>{{end}}</div><section><h2>Create actor</h2><form class="stack" method="post"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><div class="grid"><label>Username<input name="username" required pattern="[a-z0-9_-]+"></label><label>Display name<input name="display_name" required></label><label>Kind<select name="kind"><option value="human">human</option><option value="worker">worker</option></select></label><label>Role<select name="role"><option value="member">member</option><option value="admin">admin</option></select></label></div><button>Create actor</button></form></section>
 
 {{else if eq .Page "user-detail"}}<h1>{{.User.DisplayName}}</h1><p><code>{{.User.Username}}</code> · {{.User.Kind}}</p><form class="stack" method="post"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="action" value="update"><label>Display name<input name="display_name" value="{{.User.DisplayName}}" required></label><label>Role<select name="role"><option value="member" {{selected "member" .User.Role}}>member</option>{{if eq .User.Kind "human"}}<option value="admin" {{selected "admin" .User.Role}}>admin</option>{{end}}</select></label><label class="check"><input type="checkbox" name="active" {{checked .User.Active}}> Active</label><button>Save user</button></form><section><h2>API tokens</h2><form class="inline" method="post"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><input name="name" required placeholder="Token name"><button name="action" value="create-token">Create token</button></form>{{template "tokens" .}}</section>
 
@@ -60,7 +60,7 @@ const openAPIJSON = `{
   "info": {
     "title": "Task Board API",
     "version": "1.0.0",
-    "description": "Private household task coordination API. Humans use the general task API; service actors receive work through the project-scoped ready and complete operations."
+    "description": "Private household task coordination API. Humans use the general task API; workers receive owned work through ready windows and report outcomes through complete."
   },
   "servers": [{"url": "https://task-board.oorangy.com"}],
   "components": {
@@ -76,9 +76,21 @@ const openAPIJSON = `{
           "code": {"type": "string"}
         }
       },
+      "Actor": {
+        "type": "object",
+        "required": ["id", "username", "display_name", "kind", "role", "active"],
+        "properties": {
+          "id": {"type": "string"},
+          "username": {"type": "string"},
+          "display_name": {"type": "string"},
+          "kind": {"type": "string", "enum": ["human", "worker"]},
+          "role": {"type": "string", "enum": ["member", "admin"]},
+          "active": {"type": "boolean"}
+        }
+      },
       "Task": {
         "type": "object",
-        "required": ["id", "title", "description", "project_id", "created_by", "assigned_to", "status", "result", "version"],
+        "required": ["id", "title", "description", "project_id", "created_by", "assigned_to", "status", "result", "version", "queue_sequence"],
         "properties": {
           "id": {"type": "string"},
           "title": {"type": "string", "maxLength": 200},
@@ -88,14 +100,17 @@ const openAPIJSON = `{
           "assigned_to": {"type": "string"},
           "status": {"type": "string", "enum": ["todo", "doing", "done", "failed", "cancelled"]},
           "result": {"type": "string", "maxLength": 20000},
-          "version": {"type": "integer", "minimum": 1}
+          "version": {"type": "integer", "minimum": 1},
+          "queue_sequence": {"type": "integer", "minimum": 1, "readOnly": true}
         }
       },
       "ReadyInput": {
         "type": "object",
-        "required": ["project_id"],
         "additionalProperties": false,
-        "properties": {"project_id": {"type": "string"}}
+        "properties": {
+          "project_id": {"type": "string"},
+          "count": {"type": "integer", "default": 1, "minimum": 1, "maximum": 32}
+        }
       },
       "DependencyResult": {
         "type": "object",
@@ -106,13 +121,22 @@ const openAPIJSON = `{
           "result": {"type": "string"}
         }
       },
-      "WorkDelivery": {
+      "TaskDelivery": {
         "type": "object",
         "required": ["delivery", "task", "dependency_results"],
         "properties": {
           "delivery": {"type": "string", "enum": ["claimed", "resumed"]},
           "task": {"$ref": "#/components/schemas/Task"},
           "dependency_results": {"type": "array", "items": {"$ref": "#/components/schemas/DependencyResult"}}
+        }
+      },
+      "ReadyResponse": {
+        "type": "object",
+        "required": ["count", "deliveries"],
+        "properties": {
+          "project_id": {"type": "string"},
+          "count": {"type": "integer", "minimum": 1, "maximum": 32},
+          "deliveries": {"type": "array", "items": {"$ref": "#/components/schemas/TaskDelivery"}}
         }
       },
       "CompleteInput": {
@@ -140,23 +164,27 @@ const openAPIJSON = `{
   },
   "security": [{"bearer": []}],
   "paths": {
-    "/api/v1/whoami": {"get": {"summary": "Return the token actor", "responses": {"200": {"description": "Actor"}}}},
+    "/api/v1/whoami": {"get": {"summary": "Return the token actor", "responses": {"200": {"description": "Actor", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Actor"}}}}}}},
     "/api/v1/actors": {"get": {"summary": "List active actors", "responses": {"200": {"description": "Actors"}}}},
     "/api/v1/projects": {"get": {"summary": "List projects", "responses": {"200": {"description": "Projects"}}}},
     "/api/v1/work/ready": {
       "post": {
-        "summary": "Redeliver owned work or claim the oldest actionable project task",
+        "summary": "Return a status-first window of owned and newly claimed work",
+        "description": "Active workers only. Omit project_id to reconcile across all projects. Existing doing work precedes newly claimed todo work in queue_sequence order.",
+        "x-problem-codes": ["unsupported_actor_kind", "invalid_project", "invalid_count"],
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ReadyInput"}}}},
         "responses": {
-          "200": {"description": "Claimed or resumed work", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/WorkDelivery"}}}},
+          "200": {"description": "Status-first ready window", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ReadyResponse"}}}},
           "204": {"description": "No owned or actionable work"},
-          "403": {"description": "Token does not identify a service actor"}
+          "403": {"description": "Token does not identify an active worker"},
+          "422": {"description": "Invalid project or count"}
         }
       }
     },
     "/api/v1/work/{task_id}/complete": {
       "post": {
-        "summary": "Complete work owned by the service actor",
+        "summary": "Complete work owned by the worker",
+        "x-problem-codes": ["unsupported_actor_kind", "work_not_owned", "completion_conflict"],
         "parameters": [{"in": "path", "name": "task_id", "required": true, "schema": {"type": "string"}}],
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CompleteInput"}}}},
         "responses": {
@@ -166,7 +194,7 @@ const openAPIJSON = `{
       }
     },
     "/api/v1/tasks": {
-      "get": {"summary": "List and filter tasks (human actors only)", "responses": {"200": {"description": "Task page"}, "403": {"description": "Service task access forbidden"}}},
+      "get": {"summary": "List and filter tasks (human actors only)", "responses": {"200": {"description": "Task page"}, "403": {"description": "Worker task access forbidden"}}},
       "post": {
         "summary": "Create a project-bearing task",
         "parameters": [{"in": "header", "name": "Idempotency-Key", "schema": {"type": "string"}}],
@@ -175,9 +203,10 @@ const openAPIJSON = `{
       }
     },
     "/api/v1/tasks/{id}": {
-      "get": {"summary": "Get task and history (human actors only)", "responses": {"200": {"description": "Task"}, "403": {"description": "Service task access forbidden"}}},
+      "get": {"summary": "Get task and history (human actors only)", "responses": {"200": {"description": "Task"}, "403": {"description": "Worker task access forbidden"}}},
       "patch": {
         "summary": "Update a task (human actors only)",
+        "x-problem-codes": ["worker_task_access_forbidden", "queue_sequence_conflict"],
         "parameters": [{"in": "header", "name": "If-Match", "required": true, "schema": {"type": "string"}}],
         "responses": {"200": {"description": "Updated"}, "409": {"description": "Doing task details are frozen"}, "412": {"description": "Stale version"}, "428": {"description": "Missing version"}}
       }
