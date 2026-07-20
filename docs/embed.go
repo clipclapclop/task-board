@@ -2,7 +2,7 @@ package projectdocs
 
 import "embed"
 
-// FS contains the documentation served to agents by the application.
+// FS contains the worker contract served by the application.
 //
-//go:embed agents.md api.md worker-contract.md llms.txt
+//go:embed worker-contract.md
 var FS embed.FS

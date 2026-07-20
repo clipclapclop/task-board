@@ -48,6 +48,7 @@ go vet ./...
 go build ./cmd/task-board
 ```
 
-See the [worker contract](docs/worker-contract.md), [agent usage](docs/agents.md),
-[API conventions](docs/api.md), and [ContainerBot operations](docs/operations.md). The
-authoritative product scope is in [task-board-requirements.md](task-board-requirements.md).
+See the [worker contract](docs/worker-contract.md) for integration behavior and the served
+`/api/v1/openapi.json` for exact API schemas. [ContainerBot operations](docs/operations.md) covers
+deployment, and the authoritative product scope is in
+[task-board-requirements.md](task-board-requirements.md).
