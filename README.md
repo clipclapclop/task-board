@@ -3,6 +3,21 @@
 Task Board is a private household task handoff service for humans and software agents. It is a
 single Go binary with server-rendered pages, a versioned JSON API, and SQLite storage.
 
+## Update & redeploy
+
+On Host system run:
+
+```sh
+sudo systemctl start task-board-deploy.service
+sudo journalctl -u task-board-deploy.service -n 200 --no-pager
+```
+
+then verify it with:
+
+```sh
+sudo journalctl -u task-board-deploy.service -n 200 --no-pager
+```
+
 ## Local start
 
 ```sh

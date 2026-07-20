@@ -252,7 +252,7 @@ Clients should branch on stable problem codes rather than message text:
 ### Identity and scheduling
 
 - Give each independently coordinated deployment its own worker identity and token.
-- Make worker name, Task Board URL, token, and capabilities configurable.
+- Make worker name, Task Board URL, token, and local execution capabilities configurable.
 - Use one coordinator when several processes or agents operate under one worker.
 - Choose project filters and counts according to local priorities and resource costs.
 - Treat count as window size, not capacity or incremental demand.
