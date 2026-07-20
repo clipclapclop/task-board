@@ -22,7 +22,7 @@ func (s *Server) openAPI(w http.ResponseWriter, r *http.Request) {
 const portalTemplate = `{{define "portal"}}<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{{.Title}} · Task Board</title><link rel="stylesheet" href="/static/style.css"><script defer src="/static/htmx.min.js"></script></head>
-<body><header><a class="brand" href="/tasks">Task Board</a><nav><a href="/tasks">Tasks</a><a href="/tasks/new">New</a><a href="/profile">Profile</a>{{if .Current.IsAdmin}}<a href="/admin/users">Users</a><a href="/admin/projects">Projects</a>{{end}}</nav>
+<body><header><a class="brand" href="/tasks">Task Board</a><nav><a href="/tasks">Tasks</a><a href="/tasks/new">New</a><a href="/profile">Profile</a><a href="/docs/worker-contract.md">Worker contract</a>{{if .Current.IsAdmin}}<a href="/admin/users">Users</a><a href="/admin/projects">Projects</a>{{end}}</nav>
 <form class="actor-switch" method="post" action="/switch-actor"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="next" value="/tasks"><label>Acting as <select name="actor" onchange="this.form.submit()">{{range .Actors}}{{if eq .Kind "human"}}{{if .Active}}<option value="{{.Username}}" {{selected .Username $.Current.Username}}>{{.DisplayName}}</option>{{end}}{{end}}{{end}}</select></label><noscript><button>Switch</button></noscript></form></header>
 <main>{{if .Error}}<div class="alert error">{{.Error}}</div>{{end}}{{if .Notice}}<div class="alert">{{.Notice}}</div>{{end}}{{if .NewToken}}<section class="token-reveal"><h2>Copy this token now</h2><p>It will not be shown again.</p><code>{{.NewToken}}</code></section>{{end}}
 

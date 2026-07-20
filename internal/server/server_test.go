@@ -109,7 +109,7 @@ func TestPortalAndWhoAmI(t *testing.T) {
 	}
 	body, _ := io.ReadAll(res.Body)
 	res.Body.Close()
-	if res.StatusCode != 200 || !strings.Contains(string(body), "Acting as") || !strings.Contains(string(body), "Chad") {
+	if res.StatusCode != 200 || !strings.Contains(string(body), "Acting as") || !strings.Contains(string(body), "Chad") || !strings.Contains(string(body), `href="/docs/worker-contract.md">Worker contract</a>`) {
 		t.Fatalf("portal %d %s", res.StatusCode, body)
 	}
 	res, err = http.Get(f.server.URL + "/admin/users")
