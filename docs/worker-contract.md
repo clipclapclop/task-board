@@ -199,12 +199,18 @@ Content-Type: application/json
 - Only an active worker may call completion.
 - `status` must be `done` or `failed`.
 - `result` is optional and limited to 20,000 characters.
+- `result` is trimmed of surrounding whitespace and otherwise opaque. Task Board does not
+  interpret its contents; each project must establish conventions for answers, structured data,
+  and artifact references.
 - The task must be `doing` and assigned to the authenticated worker.
 - Completion atomically stores status and result, increments the version, and appends one event.
 - Tasks in a ready window may complete in any order.
 - Repeating an identical completion returns the existing task without another event.
 - Repeating with a different status or result returns `409 completion_conflict`.
-- Todo, cancelled, reassigned, or otherwise unowned tasks cannot be completed and are not mutated.
+- A `todo`, reassigned, or otherwise unowned nonterminal task returns `409 work_not_owned` and is
+  not mutated.
+- A cancelled task, or another terminal task with a different outcome, returns
+  `409 completion_conflict` and is not mutated.
 
 ## Lifecycle rules
 
@@ -214,16 +220,47 @@ title, and result; indirect and unrelated task content is not exposed.
 
 `doing` means the assigned worker owns responsibility for the task. It does not imply that a
 particular local process is currently running. While a task is `doing`, its title,
-description, project, assignee, and dependencies are frozen. Humans may still cancel owned work.
+description, project, assignee, and dependencies are frozen. Its human creator or an administrator
+may still cancel it.
+
+Task Board provides no cancellation notification, worker task-status read, or execution interrupt.
+A worker cannot reliably observe cancellation while executing and may first learn of it when
+completion returns `409 completion_conflict`. Cancellation prevents a later Task Board completion;
+it cannot undo external effects that have already occurred.
+
+Ready is also the only claim operation. Task Board does not match task contents to local execution
+capabilities and provides no reject or requeue operation after a claim. If a claimed task cannot be
+executed, the worker either reports a genuine `failed` outcome with a useful result or leaves the
+task `doing`, stops requesting additional work, and escalates for human resolution.
 
 Terminal tasks are immutable. An administrator may reopen one through the existing workflow,
 which changes it to `todo` and clears its current result while retaining history and
 `queue_sequence`. A completed blocker cannot be reopened while downstream work is `doing`.
 
+## Task creation IDs
+
+Every `POST /api/v1/tasks` request requires a non-empty opaque `Idempotency-Key`. The key is a
+client-assigned creation ID selected when one logical creation process begins. Task Board does not
+require a particular key format. A UUID, stable source operation ID, or namespaced identifier such
+as `UPSTREAM_TASK_ID:delegate-report` are valid strategies.
+
+Keys are permanent and scoped to the authenticated actor:
+
+- A validation or authorization failure creates no task and does not bind the key. The client may
+  correct or regenerate fields and try that unbound key again.
+- The first successful request binds the key to its accepted creation fields and task, returning
+  `201 Created`.
+- Reuse with identical creation fields returns the original task with `200 OK` and
+  `Idempotent-Replayed: true`. It creates no task, event, or queue sequence.
+- Reuse with different fields returns `409 idempotency_key_conflict`. It does not mutate or replace
+  the existing binding.
+
+A different logical task always requires a different key, even if its fields are identical. Task
+Board assigns no scheduling or recurrence meaning to repeated task creations.
+
 ## Delegation and result handoff
 
-Workers may create project-bearing tasks for peers or themselves, using stable task-creation
-idempotency keys. The supported handoff is:
+Workers may create project-bearing tasks for peers or themselves. The supported handoff is:
 
 1. Worker A creates task 1 for worker B.
 2. Worker A creates task 2 for itself with task 1 in `blocked_by`.
@@ -231,9 +268,11 @@ idempotency keys. The supported handoff is:
 4. Task 2 becomes actionable.
 5. A's next applicable ready window includes task 1 under task 2's `dependency_results`.
 
-Failed or cancelled blockers do not release downstream work. Task Board does not store
-attachments. Large outputs belong in project-appropriate external storage; use a stable commit ID,
-URL, shared path, or artifact identifier in `result`, without credentials.
+Failed or cancelled blockers do not release downstream work. Task Board does not automatically
+cancel, retry, or rewrite their continuations; cleanup is the responsibility of an authorized
+human or domain workflow. Task Board does not store attachments. Large outputs belong in
+project-appropriate external storage; use a stable commit ID, URL, shared path, or artifact
+identifier in `result`, without credentials.
 
 ## Error codes
 
@@ -246,6 +285,8 @@ Clients should branch on stable problem codes rather than message text:
 - `work_not_owned`
 - `completion_conflict`
 - `queue_sequence_conflict`
+- `missing_idempotency_key`
+- `idempotency_key_conflict`
 
 ## Best practices (non-normative)
 
@@ -290,7 +331,13 @@ Clients should branch on stable problem codes rather than message text:
 
 ### Delegation and observability
 
-- Use stable task-creation idempotency keys and persist returned task IDs.
+- Select a task-creation key when the logical creation process begins and carry it through content
+  generation, request assembly, and transmission; do not wait until the final send step.
+- Reuse that key while attempting the same logical creation. After success, identical fields
+  safely replay the original task and changed fields conflict.
+- Use a new key for every distinct task. Do not derive identity from task-body equality, and do not
+  rely on a datetime alone when more than one creation could share it.
+- Check for `200` with `Idempotent-Replayed: true`, and persist returned task IDs.
 - Create peer work before its blocked continuation.
 - Consume peer output through direct dependency results and store large artifacts externally.
 - Log worker ID, task ID, project ID, queue sequence, delivery type, and outcome.
@@ -331,6 +378,7 @@ tests:
 
 - startup verifies its unique worker identity;
 - project and count scheduling produces the intended local window;
+- unsupported claimed work follows the worker's failure or human-escalation policy;
 - status-first reconciliation starts no duplicate processing for resumed tasks;
 - newly unblocked work waits behind matching active work;
 - conservative unfiltered recovery finds previously owned tasks;
@@ -340,8 +388,11 @@ tests:
 - external effects are idempotent across redelivery;
 - exactly one component reports completion;
 - an ambiguous completion response is retried with the identical body;
+- task creation selects a permanent actor-scoped key early, replays identical accepted fields, and
+  rejects different fields after binding;
 - direct dependency results reach the intended downstream task; and
-- human cancellation makes later completion fail safely.
+- cancellation makes a different later completion conflict without implying that external effects
+  were interrupted.
 
 Task Board's executable tests cover the server-enforceable side. Specialized worker projects own
 their implementation tests. No generic worker executable, worker registry, or universal worker

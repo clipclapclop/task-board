@@ -63,19 +63,27 @@ curl --fail-with-body --silent --show-error -X POST \
   "$TASK_BOARD_URL/api/v1/work/TASK_UUID/complete"
 ```
 
-`result` is optional, concise, and at most 20,000 characters. It may contain a commit ID, URL,
-shared-storage path, artifact identifier, or answer, but never credentials.
+`result` is an optional string of at most 20,000 characters. Task Board trims surrounding
+whitespace but otherwise does not interpret it, so follow the project's convention for answers,
+structured data, or artifact references, and never include credentials.
 
 Persist the exact completion body until acknowledged. An identical retry is safe after an
 ambiguous response. Do not change the outcome while acknowledgement is unknown. Stop and
 reconcile `completion_conflict`, `work_not_owned`, or other stable 4xx responses. Give each task
 exactly one completion reporter; do not let both a wrapper and its task-processing code complete it.
 
+Task Board does not notify workers of cancellation or provide a worker task-status read. A
+cancelled task may first become observable when completion returns `completion_conflict`, and
+cancellation cannot undo external effects. There is also no reject or requeue operation. If local
+execution capabilities cannot handle claimed work, report a genuine `failed` result or stop
+requesting more work and escalate while leaving the task `doing` for human resolution.
+
 ## Delegate or create a continuation
 
 Resolve active IDs from `/api/v1/actors` and `/api/v1/projects`. Every task requires a project and
-a human or worker assignee. Never send `created_by`; the server derives it from the token. Use a
-stable operation-specific idempotency key:
+a human or worker assignee. Never send `created_by`; the server derives it from the token. Select
+a creation ID when the logical creation process begins, keep it through content generation and
+request transmission, and send it as the required `Idempotency-Key`:
 
 ```sh
 curl --fail-with-body --silent --show-error -X POST \
@@ -86,10 +94,15 @@ curl --fail-with-body --silent --show-error -X POST \
   "$TASK_BOARD_URL/api/v1/tasks"
 ```
 
-Persist the returned task ID. For a peer handoff, create peer work first, then create a
-self-assigned continuation blocked by the peer task ID. When the peer succeeds, its direct result
-will accompany the continuation's ready delivery. A worker cannot later browse the delegated
-task; humans handle exceptional cancellation or cleanup.
+Keys are permanent and scoped to the authenticated actor. A failed validation or authorization
+attempt leaves its key unbound. The first success binds the key to the accepted fields and task.
+Identical reuse returns the original task with `200` and `Idempotent-Replayed: true`; changed fields
+return `409 idempotency_key_conflict`. Use a new key for every distinct task and persist each
+returned task ID. For a peer handoff, create peer work first, then create a self-assigned
+continuation blocked by the peer task ID. When the peer succeeds, its direct result will accompany
+the continuation's ready delivery. Failed or cancelled peer work leaves the continuation blocked;
+Task Board does not clean it up automatically. A worker cannot later browse the delegated task, so
+authorized humans or domain workflows handle exceptional cancellation and cleanup.
 
 ## Recovery and external effects
 

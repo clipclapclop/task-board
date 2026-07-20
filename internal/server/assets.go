@@ -31,7 +31,7 @@ const portalTemplate = `{{define "portal"}}<!doctype html>
 <form class="filters" method="get"><input type="hidden" name="view" value="{{.View}}"><input name="q" value="{{.Filter.Get "q"}}" placeholder="Search title and description"><select name="project"><option value="">All projects</option>{{range .Projects}}<option value="{{.ID}}" {{selected .ID $.Filter.Get "project"}}>{{.Name}}</option>{{end}}</select><select name="status"><option value="">All statuses</option>{{range $s:=strings "todo doing done failed cancelled"}}<option value="{{$s}}" {{selected $s ($.Filter.Get "status")}}>{{$s}}</option>{{end}}</select><select name="assigned_to"><option value="">Any assignee</option>{{range .Actors}}{{if .Active}}<option value="{{.ID}}" {{selected .ID ($.Filter.Get "assigned_to")}}>Assigned: {{.DisplayName}}</option>{{end}}{{end}}</select><select name="created_by"><option value="">Any creator</option>{{range .Actors}}<option value="{{.ID}}" {{selected .ID ($.Filter.Get "created_by")}}>Created: {{.DisplayName}}</option>{{end}}</select><select name="actionable"><option value="">Any readiness</option><option value="true" {{selected "true" (.Filter.Get "actionable")}}>Actionable</option><option value="false" {{selected "false" (.Filter.Get "actionable")}}>Blocked or terminal</option></select><input name="updated_after" value="{{.Filter.Get "updated_after"}}" placeholder="Updated after (RFC 3339)"><button>Filter</button></form>
 {{if .Tasks}}<div class="task-list">{{range .Tasks}}<article class="task-card"><div><a class="task-title" href="/tasks/{{.ID}}">{{.Title}}</a><div class="meta"><span class="status {{.Status}}">{{.Status}}</span>{{if .IsBlocked}}<span class="blocked">blocked by {{len .BlockedBy}}</span>{{else if .Actionable}}<span class="actionable">actionable</span>{{end}} · updated {{timefmt .UpdatedAt}}</div></div><span class="mono">{{short .ID}}</span></article>{{end}}</div>{{if .NextURL}}<p><a class="button" href="{{.NextURL}}">Next page</a></p>{{end}}{{else}}<div class="empty">No tasks match this view.</div>{{end}}
 
-{{else if eq .Page "task-new"}}<h1>New task</h1><form class="stack" method="post" action="/tasks/new"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><label>Title<input required maxlength="200" name="title" autofocus></label><label>Description<textarea name="description" rows="7"></textarea></label><div class="grid"><label>Assign to<select required name="assigned_to">{{range .Actors}}{{if .Active}}<option value="{{.ID}}" {{selected .ID $.Current.ID}}>{{.DisplayName}} ({{.Kind}})</option>{{end}}{{end}}</select></label><label>Project<select required name="project_id"><option value="" disabled selected>Select a project</option>{{range .Projects}}{{if not .ArchivedAt}}<option value="{{.ID}}">{{.Name}}</option>{{end}}{{end}}</select></label></div><label>Blocked by<select name="blocked_by" multiple size="6">{{range .Tasks}}<option value="{{.ID}}">{{.Title}}</option>{{end}}</select><small>Optional; use Ctrl/Cmd to select more than one.</small></label><button>Create task</button></form>
+{{else if eq .Page "task-new"}}<h1>New task</h1><form class="stack" method="post" action="/tasks/new"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><input type="hidden" name="idempotency_key" value="{{.CreationID}}"><label>Title<input required maxlength="200" name="title" autofocus></label><label>Description<textarea name="description" rows="7"></textarea></label><div class="grid"><label>Assign to<select required name="assigned_to">{{range .Actors}}{{if .Active}}<option value="{{.ID}}" {{selected .ID $.Current.ID}}>{{.DisplayName}} ({{.Kind}})</option>{{end}}{{end}}</select></label><label>Project<select required name="project_id"><option value="" disabled selected>Select a project</option>{{range .Projects}}{{if not .ArchivedAt}}<option value="{{.ID}}">{{.Name}}</option>{{end}}{{end}}</select></label></div><label>Blocked by<select name="blocked_by" multiple size="6">{{range .Tasks}}<option value="{{.ID}}">{{.Title}}</option>{{end}}</select><small>Optional; use Ctrl/Cmd to select more than one.</small></label><button>Create task</button></form>
 
 {{else if eq .Page "task-detail"}}<div class="title-row"><div><h1>{{.Task.Title}}</h1><div class="meta"><span class="status {{.Task.Status}}">{{.Task.Status}}</span>{{if .Task.IsBlocked}}<span class="blocked">blocked</span>{{else if .Task.Actionable}}<span class="actionable">actionable</span>{{end}} · version {{.Task.Version}}</div></div><a href="/tasks">Back</a></div>
 {{if .Task.BlockedBy}}<section><h2>Blocked by</h2><ul>{{range .Task.BlockedBy}}<li><a href="/tasks/{{.ID}}">{{.Title}}</a> <span class="status {{.Status}}">{{.Status}}</span></li>{{end}}</ul></section>{{end}}
@@ -145,7 +145,7 @@ const openAPIJSON = `{
         "additionalProperties": false,
         "properties": {
           "status": {"type": "string", "enum": ["done", "failed"]},
-          "result": {"type": "string", "maxLength": 20000}
+          "result": {"type": "string", "maxLength": 20000, "description": "Surrounding whitespace is trimmed; contents are otherwise uninterpreted."}
         }
       },
       "CreateTaskInput": {
@@ -197,9 +197,17 @@ const openAPIJSON = `{
       "get": {"summary": "List and filter tasks (human actors only)", "responses": {"200": {"description": "Task page"}, "403": {"description": "Worker task access forbidden"}}},
       "post": {
         "summary": "Create a project-bearing task",
-        "parameters": [{"in": "header", "name": "Idempotency-Key", "schema": {"type": "string"}}],
+        "description": "Idempotency-Key is a permanent actor-scoped creation ID. A successful first use binds it to the accepted fields and task.",
+        "x-problem-codes": ["missing_idempotency_key", "idempotency_key_conflict", "invalid_project"],
+        "parameters": [{"in": "header", "name": "Idempotency-Key", "required": true, "description": "Non-empty opaque creation ID selected before the creation attempt. Reuse only for the same logical creation.", "schema": {"type": "string", "minLength": 1}}],
         "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateTaskInput"}}}},
-        "responses": {"201": {"description": "Created"}, "422": {"description": "Project missing or invalid"}}
+        "responses": {
+          "200": {"description": "Existing task replayed for identical fields", "headers": {"Idempotent-Replayed": {"required": true, "schema": {"type": "string", "const": "true"}}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Task"}}}},
+          "201": {"description": "Task created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Task"}}}},
+          "400": {"description": "Missing Idempotency-Key"},
+          "409": {"description": "Creation ID already bound to different fields"},
+          "422": {"description": "Creation fields are invalid"}
+        }
       }
     },
     "/api/v1/tasks/{id}": {

@@ -7,8 +7,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -100,6 +103,46 @@ func responseCode(t *testing.T, res *http.Response) string {
 	return body.Code
 }
 
+var creationIDPattern = regexp.MustCompile(`name="idempotency_key" value="([^"]+)"`)
+
+func portalTaskForm(t *testing.T, f fixture, client *http.Client) (string, string) {
+	t.Helper()
+	res, err := client.Get(f.server.URL + "/tasks/new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	match := creationIDPattern.FindSubmatch(body)
+	if res.StatusCode != 200 || len(match) != 2 {
+		t.Fatalf("new task form=%d %s", res.StatusCode, body)
+	}
+	var csrf string
+	for _, cookie := range client.Jar.Cookies(res.Request.URL) {
+		if cookie.Name == "task_board_csrf" {
+			csrf = cookie.Value
+		}
+	}
+	if csrf == "" {
+		t.Fatal("missing CSRF cookie")
+	}
+	return csrf, string(match[1])
+}
+
+func postPortalTask(t *testing.T, f fixture, client *http.Client, values url.Values) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest("POST", f.server.URL+"/tasks/new", strings.NewReader(values.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
+}
+
 func TestPortalAndWhoAmI(t *testing.T) {
 	f := setup(t)
 	worker, _ := workerToken(t, f, "portal-worker")
@@ -182,9 +225,139 @@ func TestAPICreatePatchAndAuthentication(t *testing.T) {
 	}
 }
 
+func TestAPITaskCreationIDs(t *testing.T) {
+	f := setup(t)
+	body := map[string]any{"title": "Created once", "project_id": f.project.ID, "assigned_to": f.admin.ID}
+	for _, headers := range []map[string]string{nil, {"Idempotency-Key": "   "}} {
+		res := request(t, f, "POST", "/api/v1/tasks", body, headers)
+		if res.StatusCode != 400 || responseCode(t, res) != "missing_idempotency_key" {
+			t.Fatalf("missing creation ID status=%d", res.StatusCode)
+		}
+	}
+
+	res := request(t, f, "POST", "/api/v1/tasks", map[string]any{"title": "Correctable", "assigned_to": f.admin.ID}, map[string]string{"Idempotency-Key": "correctable"})
+	if res.StatusCode != 422 || responseCode(t, res) != "invalid_project" {
+		t.Fatalf("invalid creation status=%d", res.StatusCode)
+	}
+	res = request(t, f, "POST", "/api/v1/tasks", body, map[string]string{"Idempotency-Key": "correctable"})
+	if res.StatusCode != 201 || res.Header.Get("Idempotent-Replayed") != "" {
+		response, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		t.Fatalf("corrected creation=%d replay=%q %s", res.StatusCode, res.Header.Get("Idempotent-Replayed"), response)
+	}
+	var created model.Task
+	if err := json.NewDecoder(res.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+
+	res = request(t, f, "POST", "/api/v1/tasks", body, map[string]string{"Idempotency-Key": "correctable"})
+	var replayed model.Task
+	if err := json.NewDecoder(res.Body).Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 200 || res.Header.Get("Idempotent-Replayed") != "true" || replayed.ID != created.ID {
+		t.Fatalf("replay=%d header=%q task=%#v", res.StatusCode, res.Header.Get("Idempotent-Replayed"), replayed)
+	}
+	res = request(t, f, "POST", "/api/v1/tasks", body, map[string]string{"Idempotency-Key": "same-fields-new-task"})
+	var sameFields model.Task
+	if err := json.NewDecoder(res.Body).Decode(&sameFields); err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 201 || sameFields.ID == created.ID {
+		t.Fatalf("distinct creation ID=%d task=%#v", res.StatusCode, sameFields)
+	}
+
+	changed := map[string]any{"title": "Changed", "project_id": f.project.ID, "assigned_to": f.admin.ID}
+	res = request(t, f, "POST", "/api/v1/tasks", changed, map[string]string{"Idempotency-Key": "correctable"})
+	if res.StatusCode != 409 || responseCode(t, res) != "idempotency_key_conflict" {
+		t.Fatalf("creation conflict status=%d", res.StatusCode)
+	}
+	res = request(t, f, "POST", "/api/v1/tasks", changed, map[string]string{"Idempotency-Key": "changed-task"})
+	if res.StatusCode != 201 {
+		t.Fatalf("new creation ID status=%d", res.StatusCode)
+	}
+	res.Body.Close()
+
+	worker, token := workerToken(t, f, "creation-worker")
+	workerFixture := f
+	workerFixture.token = token
+	workerBody := map[string]any{"title": "Created once", "project_id": f.project.ID, "assigned_to": worker.ID}
+	res = request(t, workerFixture, "POST", "/api/v1/tasks", workerBody, map[string]string{"Idempotency-Key": "correctable"})
+	if res.StatusCode != 201 {
+		t.Fatalf("actor-scoped creation ID status=%d", res.StatusCode)
+	}
+	res.Body.Close()
+}
+
+func TestPortalTaskCreationIDs(t *testing.T) {
+	f := setup(t)
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	csrf, creationID := portalTaskForm(t, f, client)
+	_, otherCreationID := portalTaskForm(t, f, client)
+	if creationID == otherCreationID {
+		t.Fatalf("separate forms reused creation ID %q", creationID)
+	}
+
+	values := url.Values{"csrf_token": {csrf}, "idempotency_key": {creationID}, "title": {"Portal task"}, "project_id": {f.project.ID}, "assigned_to": {f.admin.ID}}
+	res := postPortalTask(t, f, client, values)
+	res.Body.Close()
+	location := res.Header.Get("Location")
+	if res.StatusCode != 303 || !strings.HasPrefix(location, "/tasks/") {
+		t.Fatalf("portal create=%d location=%q", res.StatusCode, location)
+	}
+	res = postPortalTask(t, f, client, values)
+	res.Body.Close()
+	if res.StatusCode != 303 || res.Header.Get("Location") != location {
+		t.Fatalf("portal replay=%d location=%q", res.StatusCode, res.Header.Get("Location"))
+	}
+
+	changed := url.Values{"csrf_token": {csrf}, "idempotency_key": {creationID}, "title": {"Changed portal task"}, "project_id": {f.project.ID}, "assigned_to": {f.admin.ID}}
+	res = postPortalTask(t, f, client, changed)
+	conflictBody, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != 409 || !strings.Contains(string(conflictBody), "fresh New Task form") {
+		t.Fatalf("portal conflict=%d %s", res.StatusCode, conflictBody)
+	}
+
+	for _, invalidID := range []string{"", "not-a-uuid"} {
+		invalid := url.Values{"csrf_token": {csrf}, "idempotency_key": {invalidID}, "title": {"Invalid form"}, "project_id": {f.project.ID}, "assigned_to": {f.admin.ID}}
+		res = postPortalTask(t, f, client, invalid)
+		res.Body.Close()
+		if res.StatusCode != 400 {
+			t.Fatalf("invalid portal creation ID %q status=%d", invalidID, res.StatusCode)
+		}
+	}
+
+	csrf, correctableID := portalTaskForm(t, f, client)
+	correctable := url.Values{"csrf_token": {csrf}, "idempotency_key": {correctableID}, "title": {"Corrected portal task"}, "assigned_to": {f.admin.ID}}
+	res = postPortalTask(t, f, client, correctable)
+	res.Body.Close()
+	if res.StatusCode != 422 {
+		t.Fatalf("portal validation status=%d", res.StatusCode)
+	}
+	correctable.Set("project_id", f.project.ID)
+	res = postPortalTask(t, f, client, correctable)
+	res.Body.Close()
+	if res.StatusCode != 303 {
+		t.Fatalf("corrected portal creation=%d", res.StatusCode)
+	}
+
+	page, err := f.store.Tasks(context.Background(), model.TaskFilter{Limit: 20})
+	if err != nil || len(page.Data) != 2 {
+		t.Fatalf("portal tasks=%#v err=%v", page.Data, err)
+	}
+}
+
 func TestProjectsRequiredInAPIAndPortal(t *testing.T) {
 	f := setup(t)
-	res := request(t, f, "POST", "/api/v1/tasks", map[string]any{"title": "No project", "assigned_to": f.admin.ID}, nil)
+	res := request(t, f, "POST", "/api/v1/tasks", map[string]any{"title": "No project", "assigned_to": f.admin.ID}, map[string]string{"Idempotency-Key": "no-project"})
 	if res.StatusCode != 422 || responseCode(t, res) != "invalid_project" {
 		t.Fatalf("missing project status=%d", res.StatusCode)
 	}
@@ -197,7 +370,7 @@ func TestProjectsRequiredInAPIAndPortal(t *testing.T) {
 	if res.StatusCode != 200 || !strings.Contains(string(body), `select required name="project_id"`) || strings.Contains(string(body), "No project") {
 		t.Fatalf("new task project control=%d %s", res.StatusCode, body)
 	}
-	res = request(t, f, "POST", "/api/v1/tasks", map[string]any{"title": "Has project", "project_id": f.project.ID, "assigned_to": f.admin.ID}, nil)
+	res = request(t, f, "POST", "/api/v1/tasks", map[string]any{"title": "Has project", "project_id": f.project.ID, "assigned_to": f.admin.ID}, map[string]string{"Idempotency-Key": "has-project"})
 	var created model.Task
 	if err := json.NewDecoder(res.Body).Decode(&created); err != nil {
 		t.Fatal(err)
@@ -478,8 +651,17 @@ func TestPublishedWorkerContractAndOpenAPI(t *testing.T) {
 	}
 	body, _ := io.ReadAll(res.Body)
 	res.Body.Close()
-	if res.StatusCode != 200 || !strings.Contains(string(body), "Worker Interoperability Contract") || !strings.Contains(string(body), "/api/v1/work/ready") {
+	contractText := string(body)
+	if res.StatusCode != 200 || !strings.Contains(contractText, "Worker Interoperability Contract") || !strings.Contains(contractText, "/api/v1/work/ready") {
 		t.Fatalf("worker contract=%d %s", res.StatusCode, body)
+	}
+	for _, requiredText := range []string{"Keys are permanent", "Idempotent-Replayed", "missing_idempotency_key", "idempotency_key_conflict", "no cancellation notification", "no reject or requeue operation"} {
+		if !strings.Contains(contractText, requiredText) {
+			t.Fatalf("worker contract missing %q", requiredText)
+		}
+	}
+	if strings.Contains(contractText, "24-hour") || strings.Contains(contractText, "24 hours") {
+		t.Fatal("worker contract still contains expiring creation-ID guidance")
 	}
 	res, err = http.Get(f.server.URL + "/api/v1/openapi.json")
 	if err != nil {
@@ -504,6 +686,10 @@ func TestPublishedWorkerContractAndOpenAPI(t *testing.T) {
 		if _, ok := document.Components.Schemas[schema]; !ok {
 			t.Fatalf("OpenAPI missing schema %s", schema)
 		}
+	}
+	createPath, err := json.Marshal(document.Paths["/api/v1/tasks"])
+	if err != nil || !strings.Contains(string(createPath), `"required":true`) || !strings.Contains(string(createPath), "Idempotent-Replayed") || !strings.Contains(string(createPath), `"400"`) || !strings.Contains(string(createPath), `"409"`) || !strings.Contains(string(createPath), "idempotency_key_conflict") {
+		t.Fatalf("OpenAPI task creation missing idempotency retention: %s", createPath)
 	}
 	openAPIText := string(document.Components.Schemas["ReadyInput"]) + string(document.Components.Schemas["ReadyResponse"]) + string(document.Components.Schemas["Task"]) + string(document.Components.Schemas["Actor"])
 	for _, requiredText := range []string{`"count"`, `"maximum": 32`, `"deliveries"`, `"queue_sequence"`, `"worker"`} {

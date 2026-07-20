@@ -18,5 +18,12 @@ API rules:
 - A 204 ready response starts no task processing.
 - Complete owned work through `POST /api/v1/work/{task_id}/complete` using one reporter.
 - Persist and retry an identical completion body after an ambiguous response.
-- Every created task requires a project; use stable idempotency keys for retryable creation.
+- Results are trimmed strings that are otherwise uninterpreted; follow project conventions.
+- Workers receive no cancellation notification and cannot reject or requeue claimed work.
+- Every task creation requires a project and a permanent actor-scoped `Idempotency-Key` selected
+  when that logical creation begins; use a new key for every distinct task.
+- Identical creation reuse returns `200` with `Idempotent-Replayed: true`; changed fields under a
+  bound key return `409 idempotency_key_conflict`.
+- Failed or cancelled dependencies remain blocked until an authorized human or domain workflow
+  handles cleanup.
 - Never send `created_by` or place credentials in task text, results, or logs.

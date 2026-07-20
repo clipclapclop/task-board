@@ -63,11 +63,20 @@ reconcile `completion_conflict`, `work_not_owned`, or another stable 4xx respons
 new outcome. Exactly one component owns completion reporting. If a wrapper will complete the task,
 return the outcome to it instead of calling completion from an invoked agent or script.
 
+Results are trimmed of surrounding whitespace and otherwise uninterpreted; follow the project's
+result and artifact-reference convention. Task Board provides no cancellation notification or
+worker task-status read, and cancellation may first appear as `completion_conflict`. There is no
+reject or requeue operation. If a claimed task cannot be executed, report a genuine `failed`
+result or stop requesting work and escalate while leaving the task `doing` for human resolution.
+
 ## Create peer and continuation tasks
 
 Resolve IDs from `/actors` and `/projects`. Every task requires a project. Do not send
-`created_by`; the token determines it. Supply a stable operation-specific `Idempotency-Key` for a
-retryable creation and reuse it only with the identical body. Persist every returned task ID.
+`created_by`; the token determines it. Select a creation ID when the logical creation begins and
+carry it through generation, request assembly, and transmission. Send it as the required
+`Idempotency-Key`. Keys are permanent and actor-scoped. Identical reuse returns the original task
+with `200` and `Idempotent-Replayed: true`; changed fields under a bound key return
+`409 idempotency_key_conflict`. Use a new key for each distinct task and persist returned task IDs.
 
 To resume after peer work, create the peer task first, then a self-assigned continuation whose
 `blocked_by` contains the peer task ID. The peer's successful result will be included when Task
@@ -82,6 +91,8 @@ stable commit ID, URL, shared path, or artifact identifier. Never include creden
 - Do not use generic task collection, detail, PATCH, cancellation, reopen, or history routes.
 - Treat `doing` as owned responsibility until completion or human intervention.
 - Treat delivery as at-least-once and make external effects idempotent by task ID plus operation.
+- Remember that cancellation cannot interrupt or undo external effects.
 - Do not report failure merely because the worker restarted.
 - Stop requesting new work during graceful shutdown.
-- Leave exceptional cancellation and orphan cleanup to humans.
+- Leave exceptional cancellation and failed- or cancelled-dependency cleanup to authorized humans
+  or domain workflows.

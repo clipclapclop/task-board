@@ -30,6 +30,7 @@ var (
 	ErrPrecondition          = errors.New("precondition failed")
 	ErrWorkerRequired        = errors.New("worker required")
 	ErrInvalidCount          = errors.New("invalid count")
+	ErrIdempotencyConflict   = errors.New("idempotency key already identifies a task created with different fields")
 	ErrWorkNotOwned          = errors.New("work not owned")
 	ErrCompletionConflict    = errors.New("completion conflict")
 	ErrQueueSequenceConflict = errors.New("queue sequence conflict")

@@ -49,10 +49,11 @@ creation response for a task they created. Workers cannot browse task lists, det
 terminal work, and cannot directly patch, cancel, or reopen tasks.
 
 Creators may edit and cancel todo tasks. While a task is doing, its title, description, project,
-assignee, and dependencies are frozen, though a human may cancel it. Human assignees use the
-general task API. Worker assignees use ready and complete. Administrators may perform human
-actions on any task and explicitly reopen terminal tasks. Reopen clears the result, preserves
-history and queue sequence, and returns the task to todo. Other terminal mutations are forbidden.
+assignee, and dependencies are frozen, though its human creator or an administrator may cancel it.
+Human assignees use the general task API. Worker assignees use ready and complete. Administrators
+may perform human actions on any task and explicitly reopen terminal tasks. Reopen clears the
+result, preserves history and queue sequence, and returns the task to todo. Other terminal
+mutations are forbidden.
 
 A task may depend on multiple tasks, including tasks in other projects. It is actionable only when
 every blocker is `done`; failed or cancelled blockers continue blocking. Blocked tasks may not
@@ -61,6 +62,18 @@ blocker cannot be reopened while downstream work is doing.
 
 Every mutation appends an immutable event recording actor, event type, changed fields, and time.
 Comments and attachments are not part of v1.
+
+## Task creation IDs
+
+Every public task creation has a non-empty idempotency key selected when its logical creation
+process begins. API clients send it in `Idempotency-Key`; the portal generates one for each
+rendered creation form. Keys are permanent and scoped to the creating actor.
+
+A failed validation or authorization attempt does not bind its key. The first successful creation
+permanently binds the actor and key to the accepted creation fields and task. An identical reuse
+returns the original task without another event or queue sequence. Reuse with different fields
+conflicts and cannot mutate or replace the binding. A distinct logical task requires a distinct
+key, even when its fields are identical to another task.
 
 ## Worker delivery and completion
 
@@ -77,9 +90,16 @@ prefix; concurrent identical requests converge without duplicate claims or event
 
 Workers individually complete owned doing tasks as `done` or `failed`, in any order. Completion
 stores an optional result of at most 20,000 characters, increments the version, and appends one
-event. Identical retries are idempotent; a different repeated outcome conflicts. Task Board
-enforces delivery and lifecycle semantics, not result correctness or exactly-once external
-effects.
+event. Identical retries are idempotent; a different repeated outcome conflicts. Task Board trims
+surrounding result whitespace but otherwise does not interpret results; projects define their own
+result and artifact-reference conventions. Task Board enforces delivery and lifecycle semantics,
+not result correctness or exactly-once external effects.
+
+Task Board has no worker cancellation notification, task-status read, execution interrupt, or
+reject/requeue operation. Cancellation may first become observable when completion conflicts and
+cannot undo external effects. Ready does not match task contents to local execution capabilities.
+A worker that cannot execute claimed work reports `failed` or leaves it `doing` while it stops
+requesting more work and escalates for human resolution.
 
 ## Portal
 
@@ -87,7 +107,8 @@ The responsive server-rendered portal provides My Tasks, Created by Me, and All 
 actor, project, status, blocked/actionable state, update time, and text; task creation, detail, and
 editing; dependency and history views; a profile/token page; and administrator screens for actors,
 tokens, projects, and sanitized export. Project selection is required. Essential actions work
-without JavaScript. Portal and CLI labels use worker, not service or client.
+without JavaScript. Each rendered task-creation form carries a generated creation ID so repeated
+submission returns the original task. Portal and CLI labels use worker, not service or client.
 
 ## API
 
@@ -95,7 +116,8 @@ Worker routes are versioned under `/api/v1`. Operational health routes and brows
 unversioned. V1 includes actors, projects, human task list/get/patch/reopen, worker ready/complete,
 task creation, `whoami`, sanitized export, and OpenAPI endpoints. Task lists use stable cursor
 pagination. Human PATCH requires `If-Match`; missing and stale versions return 428 and 412. Task
-creation supports actor-scoped idempotency keys for 24 hours. Errors use
+creation requires a permanent actor-scoped `Idempotency-Key`; a replay returns 200 with
+`Idempotent-Replayed: true`, while changed fields under a bound key conflict. Errors use
 `application/problem+json` with stable codes.
 
 ## Security and operations

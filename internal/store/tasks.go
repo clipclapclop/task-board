@@ -23,6 +23,11 @@ type CreateTaskInput struct {
 	BlockedBy   []string `json:"blocked_by"`
 }
 
+// idempotencyExpirySentinel keeps new data readable by the previous binary,
+// which still expects a non-null expires_at value. Creation IDs are permanent;
+// current code never uses this legacy value to expire a mapping.
+const idempotencyExpirySentinel = "9999-12-31T23:59:59Z"
+
 type PatchTaskInput struct {
 	Title         *string   `json:"title,omitempty"`
 	Description   *string   `json:"description,omitempty"`
@@ -213,35 +218,39 @@ func (s *Store) CreateTask(ctx context.Context, actor model.Actor, in CreateTask
 	if !actor.Active {
 		return model.Task{}, false, ErrForbidden
 	}
-	if err := validateTaskInput(in); err != nil {
-		return model.Task{}, false, err
-	}
 	reqBody, _ := json.Marshal(in)
 	reqHash := sha256.Sum256(reqBody)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return model.Task{}, false, err
+	}
+	defer tx.Rollback()
 	if idempotencyKey != "" {
 		var stored []byte
-		var taskID, expires string
-		err := s.DB.QueryRowContext(ctx, `SELECT request_hash,task_id,expires_at FROM idempotency_keys WHERE actor_id=? AND key=?`, actor.ID, idempotencyKey).Scan(&stored, &taskID, &expires)
-		if err == nil && parseTime(expires).After(time.Now()) {
+		var taskID string
+		err := tx.QueryRowContext(ctx, `SELECT request_hash,task_id FROM idempotency_keys WHERE actor_id=? AND key=?`, actor.ID, idempotencyKey).Scan(&stored, &taskID)
+		if err == nil {
 			if string(stored) != string(reqHash[:]) {
-				return model.Task{}, false, fmt.Errorf("%w: idempotency key reused with different request", ErrConflict)
+				return model.Task{}, false, ErrIdempotencyConflict
 			}
-			t, err := s.Task(ctx, taskID)
+			t, err := taskByID(ctx, tx, taskID)
+			if err == nil {
+				err = hydrateTask(ctx, tx, &t)
+			}
 			return t, true, err
-		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
 			return model.Task{}, false, err
 		}
+	}
+	if err := validateTaskInput(in); err != nil {
+		return model.Task{}, false, err
 	}
 	id, err := NewID()
 	if err != nil {
 		return model.Task{}, false, err
 	}
 	now := time.Now().UTC()
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return model.Task{}, false, err
-	}
-	defer tx.Rollback()
 	if err = activeActorTx(ctx, tx, in.AssignedTo); err != nil {
 		return model.Task{}, false, err
 	}
@@ -267,7 +276,7 @@ func (s *Store) CreateTask(ctx context.Context, actor model.Actor, in CreateTask
 		return model.Task{}, false, err
 	}
 	if idempotencyKey != "" {
-		_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO idempotency_keys(actor_id,key,request_hash,task_id,expires_at) VALUES(?,?,?,?,?)`, actor.ID, idempotencyKey, reqHash[:], id, stamp(now.Add(24*time.Hour)))
+		_, err = tx.ExecContext(ctx, `INSERT INTO idempotency_keys(actor_id,key,request_hash,task_id,expires_at) VALUES(?,?,?,?,?)`, actor.ID, idempotencyKey, reqHash[:], id, idempotencyExpirySentinel)
 		if err != nil {
 			return model.Task{}, false, err
 		}

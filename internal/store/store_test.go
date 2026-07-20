@@ -177,6 +177,9 @@ func TestIdempotentCreate(t *testing.T) {
 	if err != nil || replayed {
 		t.Fatal(err)
 	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE idempotency_keys SET expires_at='2000-01-01T00:00:00Z' WHERE actor_id=? AND key=?`, admin.ID, "key"); err != nil {
+		t.Fatal(err)
+	}
 	second, replayed, err := s.CreateTask(ctx, admin, in, "key")
 	if err != nil || !replayed || first.ID != second.ID {
 		t.Fatalf("replay %#v %#v %v %v", first, second, replayed, err)
@@ -185,8 +188,73 @@ func TestIdempotentCreate(t *testing.T) {
 		t.Fatalf("queue sequence first=%d second=%d", first.QueueSequence, second.QueueSequence)
 	}
 	in.Title = "different"
-	if _, _, err = s.CreateTask(ctx, admin, in, "key"); !errors.Is(err, ErrConflict) {
+	if _, _, err = s.CreateTask(ctx, admin, in, "key"); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("key reuse=%v", err)
+	}
+	in.Title = "same"
+	third, replayed, err := s.CreateTask(ctx, admin, in, "other-key")
+	if err != nil || replayed || third.ID == first.ID {
+		t.Fatalf("distinct key %#v replayed=%v err=%v", third, replayed, err)
+	}
+	invalid := CreateTaskInput{Title: "correctable", AssignedTo: admin.ID}
+	if _, _, err := s.CreateTask(ctx, admin, invalid, "correctable-key"); !errors.Is(err, ErrInvalidProject) {
+		t.Fatalf("invalid creation=%v", err)
+	}
+	invalid.ProjectID = p.ID
+	if _, replayed, err := s.CreateTask(ctx, admin, invalid, "correctable-key"); err != nil || replayed {
+		t.Fatalf("corrected creation replayed=%v err=%v", replayed, err)
+	}
+}
+
+func TestConcurrentIdempotentCreate(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	admin := actor(t, s, "admin", "human", "admin")
+	p := project(t, s, admin, "work")
+	in := CreateTaskInput{Title: "concurrent", ProjectID: p.ID, AssignedTo: admin.ID}
+	type result struct {
+		task     model.Task
+		replayed bool
+		err      error
+	}
+	const callers = 16
+	results := make(chan result, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			task, replayed, err := s.CreateTask(ctx, admin, in, "concurrent-key")
+			results <- result{task: task, replayed: replayed, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	var id string
+	created := 0
+	for result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if id == "" {
+			id = result.task.ID
+		} else if result.task.ID != id {
+			t.Fatalf("concurrent IDs differ: %s != %s", result.task.ID, id)
+		}
+		if !result.replayed {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("new creations=%d", created)
+	}
+	events, err := s.TaskEvents(ctx, id)
+	if err != nil || len(events) != 1 || events[0].EventType != "created" {
+		t.Fatalf("events=%#v err=%v", events, err)
+	}
+	next := task(t, s, admin, p.ID, "next", admin.ID)
+	if next.QueueSequence != 2 {
+		t.Fatalf("next queue sequence=%d", next.QueueSequence)
 	}
 }
 
@@ -293,6 +361,9 @@ func TestQueueSequenceMigrationBackfillsCreationOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO idempotency_keys(actor_id,key,request_hash,task_id,expires_at) VALUES('actor','legacy',X'01','a','2000-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
 	s := &Store{DB: db}
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatal(err)
@@ -306,6 +377,10 @@ func TestQueueSequenceMigrationBackfillsCreationOrder(t *testing.T) {
 	created, _, err := s.CreateTask(ctx, model.Actor{ID: "actor", Kind: "human", Role: "admin", Active: true}, CreateTaskInput{Title: "next", ProjectID: "project", AssignedTo: "actor"}, "")
 	if err != nil || created.QueueSequence != 4 {
 		t.Fatalf("next sequence=%d err=%v", created.QueueSequence, err)
+	}
+	var expires string
+	if err := db.QueryRowContext(ctx, `SELECT expires_at FROM idempotency_keys WHERE actor_id='actor' AND key='legacy'`).Scan(&expires); err != nil || expires != idempotencyExpirySentinel {
+		t.Fatalf("legacy idempotency expiry=%q err=%v", expires, err)
 	}
 }
 

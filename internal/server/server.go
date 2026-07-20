@@ -19,6 +19,7 @@ import (
 	projectdocs "github.com/clipclapclop/task-board/docs"
 	"github.com/clipclapclop/task-board/internal/model"
 	"github.com/clipclapclop/task-board/internal/store"
+	"github.com/google/uuid"
 )
 
 type Config struct {
@@ -229,6 +230,8 @@ func statusFor(err error) (int, string) {
 		return 409, "completion_conflict"
 	case errors.Is(err, store.ErrQueueSequenceConflict):
 		return 409, "queue_sequence_conflict"
+	case errors.Is(err, store.ErrIdempotencyConflict):
+		return 409, "idempotency_key_conflict"
 	case errors.Is(err, store.ErrInvalidProject):
 		return 422, "invalid_project"
 	case errors.Is(err, store.ErrNotFound):
@@ -337,11 +340,16 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 		}
 		s.apiTasks(w, r)
 	case r.Method == "POST" && p == "/api/v1/tasks":
+		idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		if idempotencyKey == "" {
+			problem(w, 400, "missing_idempotency_key", "Missing idempotency key", "Idempotency-Key is required for task creation.", nil)
+			return
+		}
 		var in store.CreateTaskInput
 		if !decodeJSON(w, r, &in) {
 			return
 		}
-		t, replayed, err := s.Store.CreateTask(r.Context(), a, in, r.Header.Get("Idempotency-Key"))
+		t, replayed, err := s.Store.CreateTask(r.Context(), a, in, idempotencyKey)
 		if err != nil {
 			storeProblem(w, err)
 			return
@@ -350,7 +358,11 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Idempotent-Replayed", "true")
 		}
 		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, t.Version))
-		jsonResponse(w, 201, t)
+		if replayed {
+			jsonResponse(w, 200, t)
+		} else {
+			jsonResponse(w, 201, t)
+		}
 	case r.Method == "GET" && strings.HasPrefix(p, "/api/v1/tasks/") && !strings.HasSuffix(p, "/reopen"):
 		if a.IsWorker() {
 			problem(w, 403, "worker_task_access_forbidden", "Forbidden", "Workers cannot browse task details.", nil)
@@ -510,6 +522,7 @@ func (s *Server) currentActor(ctx context.Context, r *http.Request) (model.Actor
 
 type pageData struct {
 	Page, Title, CSRF, View, Error, Notice, NewToken string
+	CreationID                                       string
 	NextURL                                          string
 	Current                                          model.Actor
 	Actors                                           []model.Actor
@@ -633,6 +646,7 @@ func (s *Server) taskNewPage(w http.ResponseWriter, r *http.Request) {
 		s.renderError(w, r, 500, err)
 		return
 	}
+	data.CreationID = uuid.Must(uuid.NewV7()).String()
 	data.Tasks = page.Data
 	s.render(w, data)
 }
@@ -651,9 +665,19 @@ func (s *Server) taskCreateWeb(w http.ResponseWriter, r *http.Request) {
 		s.renderError(w, r, 403, err)
 		return
 	}
+	creationID := strings.TrimSpace(r.FormValue("idempotency_key"))
+	parsedCreationID, parseErr := uuid.Parse(creationID)
+	if parseErr != nil || parsedCreationID.String() != strings.ToLower(creationID) {
+		s.renderError(w, r, 400, errors.New("invalid task creation form; reload New Task and try again"))
+		return
+	}
 	in := store.CreateTaskInput{Title: r.FormValue("title"), Description: r.FormValue("description"), ProjectID: r.FormValue("project_id"), AssignedTo: r.FormValue("assigned_to"), BlockedBy: formIDs(r.Form["blocked_by"])}
-	t, _, err := s.Store.CreateTask(r.Context(), a, in, "")
+	t, _, err := s.Store.CreateTask(r.Context(), a, in, creationID)
 	if err != nil {
+		if errors.Is(err, store.ErrIdempotencyConflict) {
+			s.renderError(w, r, 409, errors.New("this form already created a task with different details; open a fresh New Task form to create another task"))
+			return
+		}
 		s.renderError(w, r, statusForWeb(err), err)
 		return
 	}

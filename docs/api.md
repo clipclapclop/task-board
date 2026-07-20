@@ -40,8 +40,10 @@ retry semantics.
 ## Stable tasks and completion
 
 Every task requires an active project and has a read-only queue sequence. While a task is doing,
-title, description, project, assignee, and dependencies are frozen. Humans may cancel owned work,
-and administrators retain explicit terminal reopen.
+title, description, project, assignee, and dependencies are frozen. Its human creator or an
+administrator may cancel it, and administrators retain explicit terminal reopen. A later worker
+completion for a cancelled task returns `409 completion_conflict`; `409 work_not_owned` applies to
+an unowned nonterminal task.
 
 Human task PATCH uses optional fields and requires `If-Match` containing the integer task version.
 Missing and stale versions return 428 and 412. Worker ready and completion enforce state
@@ -50,8 +52,11 @@ existing terminal task without another event.
 
 ## Idempotency and errors
 
-Task creation supports actor-scoped `Idempotency-Key` values for 24 hours. Reuse a key only with
-the identical body.
+Task creation requires a non-empty `Idempotency-Key`. It is a permanent creation ID scoped to the
+authenticated actor. Failed validation or authorization does not bind it. First success returns
+`201`; identical reuse returns the original task with `200` and `Idempotent-Replayed: true`;
+different fields after binding return `409 idempotency_key_conflict`. A distinct logical task
+requires a distinct key, even when its fields are identical.
 
 Errors use `application/problem+json` with `type`, `title`, `status`, `detail`, `code`, and optional
 `fields`. Clients must branch on `code`, not English detail. Worker-specific codes are:
@@ -62,7 +67,9 @@ Errors use `application/problem+json` with `type`, `title`, `status`, `detail`, 
 - `invalid_count`;
 - `work_not_owned`;
 - `completion_conflict`; and
-- `queue_sequence_conflict`.
+- `queue_sequence_conflict`;
+- `missing_idempotency_key`; and
+- `idempotency_key_conflict`.
 
 Operational endpoints `/health/live` and `/health/ready` remain unversioned and unauthenticated
 because production exposes them only to loopback and Caddy.
