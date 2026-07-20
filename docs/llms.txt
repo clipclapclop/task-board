@@ -14,8 +14,8 @@ API rules:
 - Workers do not list, fetch, patch, cancel, reopen, or browse tasks.
 - Request work with `POST /api/v1/work/ready`; `project_id` is optional and count defaults to one.
 - Ready frontloads matching doing tasks, then fills the window with actionable todo tasks.
-- Reconcile deliveries by task ID; never duplicate an executor for resumed work.
-- A 204 ready response invokes no LLM, script, or executor.
+- Reconcile deliveries by task ID; never duplicate processing for resumed work.
+- A 204 ready response starts no task processing.
 - Complete owned work through `POST /api/v1/work/{task_id}/complete` using one reporter.
 - Persist and retry an identical completion body after an ambiguous response.
 - Every created task requires a project; use stable idempotency keys for retryable creation.

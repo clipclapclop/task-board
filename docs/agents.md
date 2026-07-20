@@ -42,10 +42,10 @@ capacity.
 
 A 200 response contains a `deliveries` array. Matching `doing` tasks appear first in immutable
 queue order with `delivery: "resumed"`; actionable `todo` tasks fill unused positions with
-`delivery: "claimed"`. Reconcile by task ID. Never launch a second executor for a resumed task.
+`delivery: "claimed"`. Reconcile by task ID. Never start duplicate processing for a resumed task.
 
-A 204 response means no matching owned or actionable work exists. Do not invoke an LLM, script,
-or executor. On cold start, use an unfiltered request and conservative count when prior ownership
+A 204 response means no matching owned or actionable work exists. Do not start task processing.
+On cold start, use an unfiltered request and conservative count when prior ownership
 is uncertain. Locally track owned tasks outside the current project or count window.
 
 Each delivery includes only the results of direct completed blockers. Workers cannot fetch task
@@ -69,7 +69,7 @@ shared-storage path, artifact identifier, or answer, but never credentials.
 Persist the exact completion body until acknowledged. An identical retry is safe after an
 ambiguous response. Do not change the outcome while acknowledgement is unknown. Stop and
 reconcile `completion_conflict`, `work_not_owned`, or other stable 4xx responses. Give each task
-exactly one completion reporter; do not let both a wrapper and its executor complete it.
+exactly one completion reporter; do not let both a wrapper and its task-processing code complete it.
 
 ## Delegate or create a continuation
 
@@ -93,7 +93,7 @@ task; humans handle exceptional cancellation or cleanup.
 
 ## Recovery and external effects
 
-Persist task identity before effects, plus executor progress and pending completion state. Treat
+Persist task identity before effects, plus processing progress and pending completion state. Treat
 delivery as at-least-once. For external operations that must not repeat, use task ID plus the
 logical operation as a project-specific idempotency key. A restart alone is not a task failure.
 

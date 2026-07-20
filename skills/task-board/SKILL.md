@@ -38,9 +38,9 @@ The response `deliveries` array frontloads matching `doing` tasks in queue order
 enough actionable `todo` tasks to fill the window. Reconcile by task ID:
 
 - `delivery: claimed` means this transaction made the task owned by this worker.
-- `delivery: resumed` means the worker already owns it; load recovery state and never launch a
-  duplicate executor or blindly repeat external effects.
-- `204 No Content` means no matching work. Do not invoke an LLM, script, or executor.
+- `delivery: resumed` means the worker already owns it; load recovery state and never start
+  duplicate processing or blindly repeat external effects.
+- `204 No Content` means no matching work. Do not start task processing.
 
 On cold start with uncertain ownership, begin unfiltered with a conservative count. Track tasks
 outside the current project filter or window locally. Each delivery includes only direct completed

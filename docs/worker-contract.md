@@ -7,24 +7,19 @@
 Task Board coordinates tasks between humans and specialized workers. It guarantees valid task
 ownership, dependency gating, status-first ordered delivery, lifecycle persistence, and direct
 dependency-result handoff. A worker remains responsible for correct execution, local scheduling,
-executors, recovery, locking, and the idempotency of external effects.
+recovery, locking, and the idempotency of external effects. This contract defines the behavior a
+worker can rely on when communicating with Task Board.
 
-This is a pre-adoption v1 contract. Compatibility with the provisional service-worker API is not
-required.
-
-## Terms
+## Core concepts
 
 - **Actor:** an authenticated Task Board identity. Public actor kinds are `human` and `worker`.
-- **Worker:** configurable software that is the HTTP API client for ready and complete operations.
-  Each independently coordinated deployment has its own actor identity and token.
+- **Worker:** a configured instance of software that calls the ready and complete operations. Each
+  independently coordinated worker has its own actor identity and token.
 - **Task:** one work item. A task is assigned to exactly one human or worker through `assigned_to`.
 - **Project:** required task metadata describing what the task pertains to. It is also an optional
   ready filter, not a worker identity or placement mechanism.
-- **Executor:** an agent, script, model, process, or other local component a worker invokes to
-  perform a task. Executors are not Task Board actors unless independently configured as workers.
 
-Use “assigned” for the relationship between a task and its actor. Do not use “assignment” as a
-synonym for task.
+## Worker identity and hosts
 
 Task Board does not model hosts, machines, operating systems, IP addresses, placement, fleets,
 heartbeats, leases, worker-wide capacity, or queue-depth limits. Several workers can run on one
@@ -32,20 +27,19 @@ host, and one worker can receive tasks from any project. The same software can r
 worker identities on different hosts.
 
 Uncoordinated processes must not share a worker identity or token. A worker that uses several
-processes, agents, or executors must have one local coordinator responsible for ready
-reconciliation and one component responsible for completion reporting.
+processes or agents must coordinate ready responses and completion reporting locally.
 
 ## Identity and visibility
 
 Workers have configurable usernames and display names, their own actor IDs, one or more revocable
-tokens, and project-specific local recovery state. Workers cannot be administrators.
+tokens, and local execution and recovery state. Workers cannot be administrators.
 
 Humans may browse all tasks through authorized portal and API routes. Workers receive task content
 only through `POST /api/v1/work/ready` or the response to a task they create. Workers may list
 active actors and projects needed to create tasks, but may not:
 
 - list or fetch tasks through the generic task API;
-- browse task or terminal history;
+- browse task history or terminal tasks;
 - directly patch, cancel, or reopen tasks; or
 - inspect a task delegated to another actor after its creation response.
 
@@ -57,14 +51,9 @@ Every task has a server-generated `queue_sequence`. It is globally unique, monot
 increasing, immutable, independent of UUID randomness and client clocks, and exposed as a
 read-only task field.
 
-Task Board allocates the next sequence within the same transaction as the task, dependencies,
-creation event, and idempotency record. A failed transaction does not durably consume a sequence.
 A task retains its original sequence when it is reassigned, edited while editable, or
 administratively reopened. Consequently, a reassigned or reopened task returns to the `todo` tier
 at its original creation position.
-
-Existing records are backfilled by `created_at ASC, id ASC` during migration. This ordering is only
-the migration rule; all subsequent ready ordering uses `queue_sequence`.
 
 ## Ready request
 
@@ -102,21 +91,13 @@ Blocked and terminal tasks are excluded. Ready takes the first `count` tasks fro
 tiers. Therefore existing owned work always precedes new work in the same filter scope. A newly
 unblocked older task enters the ordered `todo` tier but never displaces `doing` work.
 
-Conceptually:
-
-```sql
-ORDER BY
-  CASE status WHEN 'doing' THEN 0 WHEN 'todo' THEN 1 END,
-  queue_sequence ASC
-```
-
 A smaller count returns an owned prefix without cancelling hidden work. A larger count redelivers
 existing work and fills only the remaining positions with actionable tasks. Ready claims no new
 task when the matching `doing` count is already at least the requested count.
 
-### Transactional behavior
+### Atomic behavior
 
-In one transaction, Task Board:
+For each ready request, Task Board atomically:
 
 1. validates the actor, optional project, and count;
 2. selects matching `doing` tasks in sequence order up to count;
@@ -124,14 +105,14 @@ In one transaction, Task Board:
 4. selects that many oldest actionable `todo` tasks;
 5. changes each selected `todo` task to `doing`, increments its version, and appends one `claimed`
    event;
-6. hydrates direct dependency results for every returned task; and
-7. commits the complete window atomically.
+6. includes direct dependency results for every returned task; and
+7. returns the complete window.
 
 If neither tier contributes a task, Task Board returns `204 No Content`.
 
 ### Response
 
-Ready always returns an array when its status is 200:
+A 200 response is an object containing a `deliveries` array:
 
 ```json
 {
@@ -232,7 +213,7 @@ and every direct blocker is `done`. Direct dependency results contain only the b
 title, and result; indirect and unrelated task content is not exposed.
 
 `doing` means the assigned worker owns responsibility for the task. It does not imply that a
-particular process or executor is currently running. While a task is `doing`, its title,
+particular local process is currently running. While a task is `doing`, its title,
 description, project, assignee, and dependencies are frozen. Humans may still cancel owned work.
 
 Terminal tasks are immutable. An administrator may reopen one through the existing workflow,
@@ -272,10 +253,10 @@ Clients should branch on stable problem codes rather than message text:
 
 - Give each independently coordinated deployment its own worker identity and token.
 - Make worker name, Task Board URL, token, and capabilities configurable.
-- Use one coordinator when several executors operate under one worker.
+- Use one coordinator when several processes or agents operate under one worker.
 - Choose project filters and counts according to local priorities and resource costs.
 - Treat count as window size, not capacity or incremental demand.
-- Reconcile every delivery by task ID and never launch a duplicate executor for a resumed task.
+- Reconcile every delivery by task ID and never start duplicate processing for a resumed task.
 - Remember that a project-filtered request can expand ownership while other-project work is active.
 
 ### Ordering
@@ -289,10 +270,11 @@ Clients should branch on stable problem codes rather than message text:
 
 - On cold start, use unfiltered ready when project ownership is uncertain.
 - Use a conservative count to recover active work serially.
-- Persist task identity before external effects, plus executor state and pending completion bodies.
+- Persist task identity before external effects, plus processing state and pending completion
+  bodies.
 - Locally track owned tasks outside the current filter or window.
 - Stop requesting new work during graceful shutdown.
-- Never invoke an executor after `204 No Content`.
+- Do not start task processing after `204 No Content`.
 - Do not report failure merely because the worker restarted.
 
 ### External effects and completion
@@ -327,13 +309,13 @@ when local scheduling policy permits work:
   response = POST /api/v1/work/ready {project_id?: P, count: N}
 
   if response is 204:
-    do not invoke an LLM, script, or executor
+    do not start task processing
     wait according to local policy
 
   for each delivery, reconciled by task ID:
     if resumed:
       load local recovery state
-      do not blindly repeat non-idempotent effects or launch a duplicate executor
+      do not blindly repeat non-idempotent effects or start a duplicate local run
     if claimed:
       persist task identity before effects
 
@@ -349,11 +331,11 @@ tests:
 
 - startup verifies its unique worker identity;
 - project and count scheduling produces the intended local window;
-- status-first reconciliation launches no duplicate executor for resumed tasks;
+- status-first reconciliation starts no duplicate processing for resumed tasks;
 - newly unblocked work waits behind matching active work;
 - conservative unfiltered recovery finds previously owned tasks;
 - tasks outside the current filter or window remain locally tracked;
-- `204` invokes no executor;
+- `204` starts no task processing;
 - graceful shutdown requests no new work;
 - external effects are idempotent across redelivery;
 - exactly one component reports completion;
